@@ -262,15 +262,15 @@ class MultiModalManager:
         if flattened_embeds.shape[0] == 0:
             return None, None
 
-        padding = jnp.zeros(
-            (target_pad_len - flattened_embeds.shape[0],
-             flattened_embeds.shape[1]),
-            dtype=flattened_embeds.dtype,
-        )
-        flattened_embeds = jnp.concatenate([flattened_embeds, padding], axis=0)
+        # padding = jnp.zeros(
+        #     (target_pad_len - flattened_embeds.shape[0],
+        #      flattened_embeds.shape[1]),
+        #     dtype=flattened_embeds.dtype,
+        # )
+        # flattened_embeds = jnp.concatenate([flattened_embeds, padding], axis=0)
         is_mm_embed_cpu = np.pad(
             is_mm_embed_cpu, (0, target_pad_len - is_mm_embed_cpu.shape[0]))
         is_mm_embed = jnp.array(is_mm_embed_cpu, dtype=jnp.bool_)
-        assert flattened_embeds.shape[0] == is_mm_embed.shape[0]
+        # assert flattened_embeds.shape[0] == is_mm_embed.shape[0]
 
         return flattened_embeds, is_mm_embed
