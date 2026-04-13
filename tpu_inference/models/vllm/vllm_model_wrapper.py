@@ -433,10 +433,11 @@ class VllmModelWrapper:
             with torchax.default_env():
                 # Ensure all tensors are moved into accelerator so the
                 # computation with weights can work properly.
-                call_kwargs = {
-                    k: jax.tree.map(move, v)
-                    for k, v in kwargs.items()
-                }
+                # call_kwargs = {
+                #     k: jax.tree.map(move, v)
+                #     for k, v in kwargs.items()
+                # }
+                call_kwargs = kwargs
                 output_from_torch = torch.func.functional_call(
                     self.model,
                     torch_view(params_and_buffers),
