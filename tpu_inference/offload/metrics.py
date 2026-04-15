@@ -1,0 +1,373 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import threading
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+from prometheus_client import Counter, Gauge, Histogram
+
+from tpu_inference.logger import init_logger
+
+logger = init_logger(__name__)
+
+# Custom buckets for latency histograms (in seconds)
+LATENCY_BUCKETS = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0,
+                   2.0, 5.0, 10.0, 20, 30, float("inf"))
+
+# Custom buckets defined in Gbps
+# Adjust these based on your hardware (e.g., PCIe 4.0/5.0 limits)
+GBPS_BUCKETS = (1.0, 10.0, 25.0, 50.0, 100.0, 200.0, 400.0, 500.0,
+                float("inf"))
+
+
+@dataclass
+class TPUKVCacheStats:
+    lookup_requests: int = 0
+    lookup_hits: int = 0
+    lookup_miss: int = 0
+    d2h_operations: int = 0
+    d2h_bytes: int = 0
+    d2h_transfer_latencies: List[float] = field(default_factory=list)
+    d2h_transfer_bw: List[float] = field(default_factory=list)
+    h2d_operations: int = 0
+    h2d_bytes: int = 0
+    h2d_transfer_latencies: List[float] = field(default_factory=list)
+    h2d_transfer_bw: List[float] = field(default_factory=list)
+    host_memory_usage_bytes: int = 0
+    staging_buffer_usage_blocks: int = 0
+    staging_buffer_free_blocks: int = 0
+
+
+class TPUKVCacheMetrics:
+    """Singleton class for collecting TPU KV Cache metrics."""
+    _instance: Optional["TPUKVCacheMetrics"] = None
+    _class_lock: threading.Lock = threading.Lock()
+
+    def __init__(self):
+        if TPUKVCacheMetrics._instance is not None:
+            raise RuntimeError("TPUKVCacheMetrics is a singleton")
+
+        self._lookup_requests: int = 0
+        self._lookup_hits: int = 0
+        self._lookup_miss: int = 0
+        self._d2h_operations: int = 0
+        self._d2h_bytes: int = 0
+        self._d2h_transfer_latencies: List[float] = []
+        self._d2h_transfer_bw: List[float] = []
+        self._h2d_operations: int = 0
+        self._h2d_bytes: int = 0
+        self._h2d_transfer_latencies: List[float] = []
+        self._h2d_transfer_bw: List[float] = []
+        self._host_memory_usage_bytes: int = 0
+        self._staging_buffer_usage_blocks: int = 0
+        self._staging_buffer_free_blocks: int = 0
+
+        self._instance_lock = threading.Lock()
+        self._reset_state()
+
+    @classmethod
+    def get_or_create(cls) -> "TPUKVCacheMetrics":
+        if cls._instance is None:
+            with cls._class_lock:
+                cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def destroy_instance(cls) -> None:
+        with cls._class_lock:
+            cls._instance = None
+
+    def record_lookup_request(self):
+        with self._instance_lock:
+            self._lookup_requests += 1
+
+    def record_cache_hit(self, tokens: int):
+        with self._instance_lock:
+            self._lookup_hits += tokens
+
+    def record_cache_miss(self, tokens: int):
+        with self._instance_lock:
+            self._lookup_miss += tokens
+
+    def record_d2h_operation(self):
+        with self._instance_lock:
+            self._d2h_operations += 1
+
+    def record_d2h_transfer_latency(self, duration: float):
+        with self._instance_lock:
+            self._d2h_transfer_latencies.append(duration)
+
+    def record_d2h_transfer_bw(self, bandwidth: float):
+        with self._instance_lock:
+            self._d2h_transfer_bw.append(bandwidth)
+
+    def record_d2h_bytes(self, bytes: int):
+        with self._instance_lock:
+            self._d2h_bytes = bytes
+
+    def record_h2d_operation(self):
+        with self._instance_lock:
+            self._h2d_operations += 1
+
+    def record_h2d_transfer_latency(self, duration: float):
+        with self._instance_lock:
+            self._h2d_transfer_latencies.append(duration)
+
+    def record_h2d_transfer_bw(self, bandwidth: float):
+        with self._instance_lock:
+            self._h2d_transfer_bw.append(bandwidth)
+
+    def record_h2d_bytes(self, bytes: int):
+        with self._instance_lock:
+            self._h2d_bytes = bytes
+
+    def record_host_memory_usage(self, bytes_used: int):
+        with self._instance_lock:
+            self._host_memory_usage_bytes = bytes_used
+
+    def record_staging_buffer_usage(self, blocks_used: int):
+        with self._instance_lock:
+            self._staging_buffer_usage_blocks = blocks_used
+
+    def record_staging_buffer_free(self, blocks_free: int):
+        with self._instance_lock:
+            self._staging_buffer_free_blocks = blocks_free
+
+    def _reset_state(self):
+        self._lookup_requests = 0
+        self._lookup_hits = 0
+        self._lookup_miss = 0
+        self._d2h_operations = 0
+        self._d2h_bytes = 0
+        self._d2h_transfer_latencies.clear()
+        self._d2h_transfer_bw.clear()
+        self._h2d_operations = 0
+        self._h2d_bytes = 0
+        self._h2d_transfer_latencies.clear()
+        self._h2d_transfer_bw.clear()
+        self._host_memory_usage_bytes = 0
+        self._staging_buffer_usage_blocks = 0
+        self._staging_buffer_free_blocks = 0
+
+    def get_stats_and_clear(self) -> TPUKVCacheStats:
+        with self._instance_lock:
+            stats = TPUKVCacheStats(
+                lookup_requests=self._lookup_requests,
+                lookup_hits=self._lookup_hits,
+                lookup_miss=self._lookup_miss,
+                d2h_operations=self._d2h_operations,
+                d2h_bytes=self._d2h_bytes,
+                d2h_transfer_latencies=list(self._d2h_transfer_latencies),
+                d2h_transfer_bw=list(self._d2h_transfer_bw),
+                h2d_operations=self._h2d_operations,
+                h2d_bytes=self._h2d_bytes,
+                h2d_transfer_latencies=list(self._h2d_transfer_latencies),
+                h2d_transfer_bw=list(self._h2d_transfer_bw),
+                host_memory_usage_bytes=self._host_memory_usage_bytes,
+                staging_buffer_usage_blocks=self._staging_buffer_usage_blocks,
+                staging_buffer_free_blocks=self._staging_buffer_free_blocks,
+            )
+            self._reset_state()
+        return stats
+
+
+class PrometheusLogger:
+    _instance: Optional["PrometheusLogger"] = None
+    _class_lock: threading.Lock = threading.Lock()
+
+    def __init__(self):
+        if PrometheusLogger._instance is not None:
+            raise RuntimeError("PrometheusLogger is a singleton")
+
+        # Ensure PROMETHEUS_MULTIPROC_DIR is set before any metric registration
+        pmd = os.environ.get("PROMETHEUS_MULTIPROC_DIR",
+                             "/tmp/prometheus_multiproc")
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = pmd
+        os.makedirs(pmd, exist_ok=True)
+
+        self.lookup_requests = Counter(
+            "tpu_inference:prefix_cache_lookup_queries_total",
+            "Total number of prefix cache lookup queries",
+        )
+        self.lookup_hit = Counter(
+            "tpu_inference:prefix_cache_hits_total",
+            "Total number of tokens prefix cache hits",
+        )
+        self.lookup_miss = Counter(
+            "tpu_inference:prefix_cache_miss_total",
+            "Total number of tokens prefix cache miss",
+        )
+        self.d2h_operations = Counter(
+            "tpu_inference:prefix_cache_d2h_operations_total",
+            "Total number of save data from device to host memory operations",
+        )
+        self.d2h_transfer_duration = Histogram(
+            "tpu_inference:prefix_cache_d2h_transfer_duration_seconds",
+            "Latency of transfer KV cache from device to host memory",
+            buckets=LATENCY_BUCKETS,
+        )
+        self.d2h_transfer_bw = Histogram(
+            "tpu_inference:prefix_cache_d2h_transfer_bw",
+            "Bandwidth of transfer KV cache from device to host memory in gbps",
+            unit="gbps",
+            buckets=GBPS_BUCKETS,
+        )
+        self.d2h_bytes = Gauge(
+            "tpu_inference:prefix_cache_d2h_request",
+            "Size of individual save requests from device to host memory",
+            unit="bytes")
+        self.h2d_operations = Counter(
+            "tpu_inference:prefix_cache_h2d_operations_total",
+            "Total number of load data from host memory to device operations",
+        )
+        self.h2d_transfer_duration = Histogram(
+            "tpu_inference:prefix_cache_h2d_transfer_duration_seconds",
+            "Latency of transfer KV cache from host memory to device",
+            buckets=LATENCY_BUCKETS,
+        )
+        self.h2d_transfer_bw = Histogram(
+            "tpu_inference:prefix_cache_h2d_transfer_bw",
+            "Bandwidth of transfer KV cache from host memory to device in gbps",
+            unit="gbps",
+            buckets=GBPS_BUCKETS,
+        )
+        self.h2d_bytes = Gauge(
+            "tpu_inference:prefix_cache_h2d_request",
+            "Size of individual load requests from host memory to device",
+            unit="bytes")
+        self.host_memory_usage = Gauge(
+            "tpu_inference:prefix_cache_host_memory_usage",
+            "Current host memory usage by the KV cache offload system",
+            unit="bytes")
+        self.staging_buffer_usage = Gauge(
+            "tpu_inference:prefix_cache_staging_buffer_usage",
+            "Current staging buffer usage by the KV cache offload system",
+            unit="blocks")
+        self.staging_buffer_free = Gauge(
+            "tpu_inference:prefix_cache_staging_buffer_free",
+            "Current staging buffer free for the KV cache offload system",
+            unit="blocks")
+
+    def log_stats(self, stats: TPUKVCacheStats):
+        """Updates Prometheus metrics from TPUKVCacheStats."""
+
+        if stats.lookup_requests > 0:
+            self.lookup_requests.inc(stats.lookup_requests)
+        if stats.lookup_hits > 0:
+            self.lookup_hit.inc(stats.lookup_hits)
+        if stats.lookup_miss > 0:
+            self.lookup_miss.inc(stats.lookup_miss)
+        if stats.d2h_operations > 0:
+            self.d2h_operations.inc(stats.d2h_operations)
+        if stats.h2d_operations > 0:
+            self.h2d_operations.inc(stats.h2d_operations)
+
+        for latency in stats.d2h_transfer_latencies:
+            self.d2h_transfer_duration.observe(latency)
+        for bandwidth in stats.d2h_transfer_bw:
+            self.d2h_transfer_bw.observe(bandwidth)
+        for latency in stats.h2d_transfer_latencies:
+            self.h2d_transfer_duration.observe(latency)
+        for bandwidth in stats.h2d_transfer_bw:
+            self.h2d_transfer_bw.observe(bandwidth)
+
+        self.d2h_bytes.set(stats.d2h_bytes)
+        self.h2d_bytes.set(stats.h2d_bytes)
+        self.host_memory_usage.set(stats.host_memory_usage_bytes)
+        self.staging_buffer_usage.set(stats.staging_buffer_usage_blocks)
+        self.staging_buffer_free.set(stats.staging_buffer_free_blocks)
+
+    @classmethod
+    def get_or_create(cls) -> "PrometheusLogger":
+        if cls._instance is None:
+            with cls._class_lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def get_instance(cls) -> "PrometheusLogger":
+        assert cls._instance is not None, (
+            "PrometheusLogger instance not created yet")
+        return cls._instance
+
+    @classmethod
+    def get_instance_or_none(cls) -> Optional["PrometheusLogger"]:
+        """
+        Returns the singleton instance of PrometheusLogger if it exists,
+        otherwise returns None.
+        """
+        return cls._instance
+
+
+class TPUKVCacheStatsLogger:
+
+    def __init__(
+        self,
+        log_interval: int,
+    ):
+        logger.info(
+            f"Initiating TPUKVCacheStatsLogger, log interval: {log_interval} seconds"
+        )
+        self.log_interval = log_interval
+        self.metrics = TPUKVCacheMetrics.get_or_create()
+        self.prometheus_logger = PrometheusLogger.get_or_create()
+        self.is_running = True
+        self.shutdown_event = threading.Event()
+
+        self.thread = threading.Thread(target=self.log_worker,
+                                       daemon=True,
+                                       name="stats-logger-thread")
+        self.thread.start()
+
+    def log_worker(self):
+        while self.is_running:
+            stats = self.metrics.get_stats_and_clear()
+            self.prometheus_logger.log_stats(stats)
+            self.shutdown_event.wait(self.log_interval)
+
+    def shutdown(self):
+        """Gracefully shuts down the stats logger thread, waking it immediately if sleeping."""
+        logger.info("Initiating shutdown of TPUKVCacheStatsLogger...")
+
+        # 1. Signal the worker thread to stop and wake it from any sleep state
+        self.is_running = False
+        self.shutdown_event.set()
+
+        # 2. Early exit if the thread has already finished
+        if not self.thread.is_alive():
+            logger.info("Stats logger thread has already stopped.")
+            logger.info("TPUKVCacheStatsLogger shutdown complete.")
+            return
+
+        # 3. Wait for the thread to finish its current loop
+        timeout = 5.0
+        logger.info(
+            f"Waiting up to {timeout}s for the stats logger thread to finish..."
+        )
+
+        self.thread.join(timeout=timeout)
+
+        # 4. Verify termination
+        if self.thread.is_alive():
+            logger.warning(
+                f"Stats logger thread failed to terminate within the {timeout}s timeout. "
+                "It may be blocked on an I/O operation. Proceeding with shutdown."
+            )
+        else:
+            logger.info("Stats logger thread terminated successfully.")
+
+        logger.info("TPUKVCacheStatsLogger shutdown complete.")
