@@ -123,8 +123,10 @@ upload_pipeline() {
       export TPU_QUEUE_SINGLE="tpu_v7x_2_queue"
       export TPU_QUEUE_MULTI="tpu_v7x_8_queue"
       export COV_FAIL_UNDER="67"
+      export TENSOR_PARALLEL_SIZE_SINGLE=2
+      export TENSOR_PARALLEL_SIZE_MULTI=8
       upload_with_priority .buildkite/pipeline_jax.yml
-      unset TPU_VERSION TPU_QUEUE_SINGLE TPU_QUEUE_MULTI COV_FAIL_UNDER
+      unset TESTS_GROUP_LABEL TPU_VERSION TPU_QUEUE_SINGLE TPU_QUEUE_MULTI COV_FAIL_UNDER TENSOR_PARALLEL_SIZE_SINGLE TENSOR_PARALLEL_SIZE_MULTI
 
       # buildkite-agent pipeline upload .buildkite/pipeline_torch.yml
       upload_with_priority .buildkite/nightly_releases.yml
@@ -185,8 +187,10 @@ if [[ $BUILDKITE_PIPELINE_SLUG == "tpu-vllm-integration" ]]; then
     export TPU_QUEUE_SINGLE="tpu_v7x_2_queue"
     export TPU_QUEUE_MULTI="tpu_v7x_8_queue"
     export COV_FAIL_UNDER="67"
+    export TENSOR_PARALLEL_SIZE_SINGLE=2
+    export TENSOR_PARALLEL_SIZE_MULTI=8
     upload_with_priority .buildkite/pipeline_jax.yml
-    unset TPU_VERSION TPU_QUEUE_SINGLE TPU_QUEUE_MULTI COV_FAIL_UNDER
+    unset TESTS_GROUP_LABEL TPU_VERSION TPU_QUEUE_SINGLE TPU_QUEUE_MULTI COV_FAIL_UNDER TENSOR_PARALLEL_SIZE_SINGLE TENSOR_PARALLEL_SIZE_MULTI
 
     # Upload JAX pipeline for v6 (default)
     upload_with_priority .buildkite/pipeline_jax.yml
