@@ -26,6 +26,8 @@ from tpu_inference.layers.vllm.quantization.compressed_tensors.compressed_tensor
     VllmCompressedTensorsConfig
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.layers.vllm.quantization.fp8 import VllmFp8Config
+from tpu_inference.layers.vllm.quantization.modelopt import (
+    VllmModelOptFp8Config, VllmModelOptMxFp8Config, VllmModelOptNvFp4Config)
 from tpu_inference.layers.vllm.quantization.mxfp4 import VllmMxfp4Config
 from tpu_inference.layers.vllm.quantization.unquantized import \
     VllmUnquantizedConfig
@@ -41,6 +43,9 @@ def get_tpu_quantization_config(vllm_config: VllmConfig,
         quant_methods.AWQ: VllmAWQConfig,
         quant_methods.FP8: VllmFp8Config,
         quant_methods.MXFP4: VllmMxfp4Config,
+        quant_methods.MODELOPT: VllmModelOptFp8Config,
+        quant_methods.MODELOPT_NVFP4: VllmModelOptNvFp4Config,
+        quant_methods.MODELOPT_MXFP8: VllmModelOptMxFp8Config,
     }
     if model_config.quantization not in method_to_config:
         raise NotImplementedError(
