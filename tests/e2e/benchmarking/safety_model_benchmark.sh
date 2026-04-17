@@ -340,7 +340,7 @@ download_mm_safetybench_dataset() {
         local zip_file="${MM_SAFETYBENCH_DIR}/MM-SafetyBench_imgs.zip"
         
         # Use gdown to handle Google Drive download
-        if ! gdown --fuzzy --id 1xjW9k-aGkmwycqGCXbru70FaSKhSDcR_ -O "$zip_file"; then
+        if ! gdown 1xjW9k-aGkmwycqGCXbru70FaSKhSDcR_ -O "$zip_file"; then
             echo "Error: Failed to download MM-SafetyBench images." >&2
             return 1
         fi
