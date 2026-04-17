@@ -32,6 +32,10 @@ LATENCY_BUCKETS = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0,
 GBPS_BUCKETS = (1.0, 10.0, 25.0, 50.0, 100.0, 200.0, 400.0, 500.0,
                 float("inf"))
 
+# Define buckets for bytes (e.g., 1KB to 100MB+)
+BYTE_BUCKETS = (1024, 10240, 102400, 1048576, 10485760, 104857600,
+                float("inf"))
+
 
 @dataclass
 class TPUKVCacheStats:
@@ -39,11 +43,11 @@ class TPUKVCacheStats:
     lookup_hits: int = 0
     lookup_miss: int = 0
     d2h_operations: int = 0
-    d2h_bytes: int = 0
+    d2h_bytes: List[int] = field(default_factory=list)
     d2h_transfer_latencies: List[float] = field(default_factory=list)
     d2h_transfer_bw: List[float] = field(default_factory=list)
     h2d_operations: int = 0
-    h2d_bytes: int = 0
+    h2d_bytes: List[int] = field(default_factory=list)
     h2d_transfer_latencies: List[float] = field(default_factory=list)
     h2d_transfer_bw: List[float] = field(default_factory=list)
     host_memory_usage_bytes: int = 0
@@ -64,11 +68,11 @@ class TPUKVCacheMetrics:
         self._lookup_hits: int = 0
         self._lookup_miss: int = 0
         self._d2h_operations: int = 0
-        self._d2h_bytes: int = 0
+        self._d2h_bytes: List[int] = []
         self._d2h_transfer_latencies: List[float] = []
         self._d2h_transfer_bw: List[float] = []
         self._h2d_operations: int = 0
-        self._h2d_bytes: int = 0
+        self._h2d_bytes: List[int] = []
         self._h2d_transfer_latencies: List[float] = []
         self._h2d_transfer_bw: List[float] = []
         self._host_memory_usage_bytes: int = 0
@@ -116,7 +120,7 @@ class TPUKVCacheMetrics:
 
     def record_d2h_bytes(self, bytes: int):
         with self._instance_lock:
-            self._d2h_bytes = bytes
+            self._d2h_bytes.append(bytes)
 
     def record_h2d_operation(self):
         with self._instance_lock:
@@ -132,7 +136,7 @@ class TPUKVCacheMetrics:
 
     def record_h2d_bytes(self, bytes: int):
         with self._instance_lock:
-            self._h2d_bytes = bytes
+            self._h2d_bytes.append(bytes)
 
     def record_host_memory_usage(self, bytes_used: int):
         with self._instance_lock:
@@ -151,11 +155,11 @@ class TPUKVCacheMetrics:
         self._lookup_hits = 0
         self._lookup_miss = 0
         self._d2h_operations = 0
-        self._d2h_bytes = 0
+        self._d2h_bytes.clear()
         self._d2h_transfer_latencies.clear()
         self._d2h_transfer_bw.clear()
         self._h2d_operations = 0
-        self._h2d_bytes = 0
+        self._h2d_bytes.clear()
         self._h2d_transfer_latencies.clear()
         self._h2d_transfer_bw.clear()
         self._host_memory_usage_bytes = 0
@@ -169,11 +173,11 @@ class TPUKVCacheMetrics:
                 lookup_hits=self._lookup_hits,
                 lookup_miss=self._lookup_miss,
                 d2h_operations=self._d2h_operations,
-                d2h_bytes=self._d2h_bytes,
+                d2h_bytes=list(self._d2h_bytes),
                 d2h_transfer_latencies=list(self._d2h_transfer_latencies),
                 d2h_transfer_bw=list(self._d2h_transfer_bw),
                 h2d_operations=self._h2d_operations,
-                h2d_bytes=self._h2d_bytes,
+                h2d_bytes=list(self._h2d_bytes),
                 h2d_transfer_latencies=list(self._h2d_transfer_latencies),
                 h2d_transfer_bw=list(self._h2d_transfer_bw),
                 host_memory_usage_bytes=self._host_memory_usage_bytes,
@@ -185,10 +189,16 @@ class TPUKVCacheMetrics:
 
 
 class PrometheusLogger:
+    _gauge_cls = Gauge
+    _counter_cls = Counter
+    _histogram_cls = Histogram
+
     _instance: Optional["PrometheusLogger"] = None
     _class_lock: threading.Lock = threading.Lock()
 
-    def __init__(self):
+    def __init__(self,
+                 model_name: Optional[str] = None,
+                 device_type: Optional[str] = None):
         if PrometheusLogger._instance is not None:
             raise RuntimeError("PrometheusLogger is a singleton")
 
@@ -198,68 +208,88 @@ class PrometheusLogger:
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = pmd
         os.makedirs(pmd, exist_ok=True)
 
-        self.lookup_requests = Counter(
+        labels = {
+            "model_name": model_name,
+            "device_type": device_type,
+        }
+        labelnames = list(labels.keys())
+
+        self.lookup_requests = self._counter_cls(
             "tpu_inference:prefix_cache_lookup_queries_total",
             "Total number of prefix cache lookup queries",
-        )
-        self.lookup_hit = Counter(
+            labelnames=labelnames,
+        ).labels(**labels)
+        self.lookup_hit = self._counter_cls(
             "tpu_inference:prefix_cache_hits_total",
             "Total number of tokens prefix cache hits",
-        )
-        self.lookup_miss = Counter(
+            labelnames=labelnames,
+        ).labels(**labels)
+        self.lookup_miss = self._counter_cls(
             "tpu_inference:prefix_cache_miss_total",
             "Total number of tokens prefix cache miss",
-        )
-        self.d2h_operations = Counter(
+            labelnames=labelnames,
+        ).labels(**labels)
+        self.d2h_operations = self._counter_cls(
             "tpu_inference:prefix_cache_d2h_operations_total",
             "Total number of save data from device to host memory operations",
-        )
-        self.d2h_transfer_duration = Histogram(
+            labelnames=labelnames,
+        ).labels(**labels)
+        self.d2h_transfer_duration = self._histogram_cls(
             "tpu_inference:prefix_cache_d2h_transfer_duration_seconds",
             "Latency of transfer KV cache from device to host memory",
+            labelnames=labelnames,
             buckets=LATENCY_BUCKETS,
-        )
-        self.d2h_transfer_bw = Histogram(
+        ).labels(**labels)
+        self.d2h_transfer_bw = self._histogram_cls(
             "tpu_inference:prefix_cache_d2h_transfer_bw",
             "Bandwidth of transfer KV cache from device to host memory in gbps",
+            labelnames=labelnames,
             unit="gbps",
             buckets=GBPS_BUCKETS,
-        )
-        self.d2h_bytes = Gauge(
-            "tpu_inference:prefix_cache_d2h_request",
-            "Size of individual save requests from device to host memory",
-            unit="bytes")
-        self.h2d_operations = Counter(
+        ).labels(**labels)
+        self.d2h_bytes = self._histogram_cls(
+            "tpu_inference:prefix_cache_d2h_request_bytes",
+            "Distribution of save request sizes (D2H)",
+            labelnames=labelnames,
+            buckets=BYTE_BUCKETS).labels(**labels)
+        self.h2d_operations = self._counter_cls(
             "tpu_inference:prefix_cache_h2d_operations_total",
             "Total number of load data from host memory to device operations",
-        )
-        self.h2d_transfer_duration = Histogram(
+            labelnames=labelnames,
+        ).labels(**labels)
+        self.h2d_transfer_duration = self._histogram_cls(
             "tpu_inference:prefix_cache_h2d_transfer_duration_seconds",
             "Latency of transfer KV cache from host memory to device",
+            labelnames=labelnames,
             buckets=LATENCY_BUCKETS,
-        )
-        self.h2d_transfer_bw = Histogram(
+        ).labels(**labels)
+        self.h2d_transfer_bw = self._histogram_cls(
             "tpu_inference:prefix_cache_h2d_transfer_bw",
             "Bandwidth of transfer KV cache from host memory to device in gbps",
+            labelnames=labelnames,
             unit="gbps",
             buckets=GBPS_BUCKETS,
-        )
-        self.h2d_bytes = Gauge(
-            "tpu_inference:prefix_cache_h2d_request",
-            "Size of individual load requests from host memory to device",
-            unit="bytes")
-        self.host_memory_usage = Gauge(
+        ).labels(**labels)
+        self.h2d_bytes = self._histogram_cls(
+            "tpu_inference:prefix_cache_h2d_request_bytes",
+            "Distribution of load request sizes (H2D)",
+            labelnames=labelnames,
+            buckets=BYTE_BUCKETS).labels(**labels)
+        self.host_memory_usage = self._gauge_cls(
             "tpu_inference:prefix_cache_host_memory_usage",
             "Current host memory usage by the KV cache offload system",
-            unit="bytes")
-        self.staging_buffer_usage = Gauge(
+            labelnames=labelnames,
+            unit="GiB").labels(**labels)
+        self.staging_buffer_usage = self._gauge_cls(
             "tpu_inference:prefix_cache_staging_buffer_usage",
             "Current staging buffer usage by the KV cache offload system",
-            unit="blocks")
-        self.staging_buffer_free = Gauge(
+            labelnames=labelnames,
+            unit="blocks").labels(**labels)
+        self.staging_buffer_free = self._gauge_cls(
             "tpu_inference:prefix_cache_staging_buffer_free",
             "Current staging buffer free for the KV cache offload system",
-            unit="blocks")
+            labelnames=labelnames,
+            unit="blocks").labels(**labels)
 
     def log_stats(self, stats: TPUKVCacheStats):
         """Updates Prometheus metrics from TPUKVCacheStats."""
@@ -283,19 +313,23 @@ class PrometheusLogger:
             self.h2d_transfer_duration.observe(latency)
         for bandwidth in stats.h2d_transfer_bw:
             self.h2d_transfer_bw.observe(bandwidth)
+        for size in stats.d2h_bytes:
+            self.d2h_bytes.observe(size)
+        for size in stats.h2d_bytes:
+            self.h2d_bytes.observe(size)
 
-        self.d2h_bytes.set(stats.d2h_bytes)
-        self.h2d_bytes.set(stats.h2d_bytes)
-        self.host_memory_usage.set(stats.host_memory_usage_bytes)
+        self.host_memory_usage.set(stats.host_memory_usage_bytes / (1024**3))
         self.staging_buffer_usage.set(stats.staging_buffer_usage_blocks)
         self.staging_buffer_free.set(stats.staging_buffer_free_blocks)
 
     @classmethod
-    def get_or_create(cls) -> "PrometheusLogger":
+    def get_or_create(cls,
+                      model: Optional[str] = None,
+                      device_type: Optional[str] = None) -> "PrometheusLogger":
         if cls._instance is None:
             with cls._class_lock:
                 if cls._instance is None:
-                    cls._instance = cls()
+                    cls._instance = cls(model, device_type)
         return cls._instance
 
     @classmethod
@@ -315,29 +349,31 @@ class PrometheusLogger:
 
 class TPUKVCacheStatsLogger:
 
-    def __init__(
-        self,
-        log_interval: int,
-    ):
+    def __init__(self,
+                 log_interval: int,
+                 model_name: Optional[str] = None,
+                 device_type: Optional[str] = None):
         logger.info(
             f"Initiating TPUKVCacheStatsLogger, log interval: {log_interval} seconds"
         )
         self.log_interval = log_interval
         self.metrics = TPUKVCacheMetrics.get_or_create()
-        self.prometheus_logger = PrometheusLogger.get_or_create()
+        self.prometheus_logger = PrometheusLogger.get_or_create(
+            model_name, device_type)
         self.is_running = True
         self.shutdown_event = threading.Event()
-
         self.thread = threading.Thread(target=self.log_worker,
                                        daemon=True,
-                                       name="stats-logger-thread")
+                                       name="tpukvcachestats-logger-thread")
         self.thread.start()
 
     def log_worker(self):
-        while self.is_running:
+        while not self.shutdown_event.is_set():
             stats = self.metrics.get_stats_and_clear()
             self.prometheus_logger.log_stats(stats)
-            self.shutdown_event.wait(self.log_interval)
+            # wait returns True if the flag is set, False if timeout
+            if self.shutdown_event.wait(self.log_interval):
+                break
 
     def shutdown(self):
         """Gracefully shuts down the stats logger thread, waking it immediately if sleeping."""

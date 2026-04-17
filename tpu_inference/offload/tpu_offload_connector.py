@@ -662,9 +662,6 @@ class TPUOffloadConnectorScheduler():
         logger.info(
             f"Request {request.request_id}: Found {num_matched_tokens} (out of {request.num_tokens} existing tokens) matched tokens ({num_matched_blocks} blocks) in CPU backend (computed_blocks: {num_computed_blocks}, blocks_to_load: {num_blocks_to_load})."
         )
-        self.metrics_collector.record_cache_hit(num_matched_tokens)
-        self.metrics_collector.record_cache_miss(request.num_tokens -
-                                                 num_matched_tokens)
 
         if num_blocks_to_load > 0:
             # TODO: add metrics here to verify there is blocks to load ever
@@ -701,6 +698,9 @@ class TPUOffloadConnectorScheduler():
         # record the matched tokens in the cache, it will be needed in
         # init save_spec
         self._external_cache_hits[request.request_id] = num_matched_tokens
+        self.metrics_collector.record_cache_hit(num_matched_tokens)
+        self.metrics_collector.record_cache_miss(request.num_tokens -
+                                                 num_matched_tokens)
 
         is_full_prefix_hit = (num_matched_tokens > 0
                               and num_matched_tokens == request.num_tokens)

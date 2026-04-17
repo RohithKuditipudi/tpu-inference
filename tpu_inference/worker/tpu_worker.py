@@ -326,7 +326,9 @@ class TPUWorker(WorkerBase):
 
                 # Start the background thread (logging every TPU_OFFLOAD_METRICS_LOG_INTERVAL seconds)
                 self.stats_logger = TPUKVCacheStatsLogger(
-                    log_interval=envs.TPU_OFFLOAD_METRICS_LOG_INTERVAL)
+                    log_interval=envs.TPU_OFFLOAD_METRICS_LOG_INTERVAL,
+                    model_name=self.model_config.model,
+                    device_type=self.device_config.device_type)
                 logger.info(
                     f"TPUKVCacheStatsLogger initialized on worker rank {self.rank}."
                 )
