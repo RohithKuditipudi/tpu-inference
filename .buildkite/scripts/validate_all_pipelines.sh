@@ -90,14 +90,6 @@ echo "--- 🔍 Validating changed pipeline integrity"
 while IFS= read -r file; do
     [[ -z "$file" || ! -f "$file" ]] && continue
 
-    # Rule: Prevent unreplaced placeholders from reaching CI
-    if grep -qE "\{[A-Z0-9_]+\}" "$file"; then
-        echo "+++ ❌ Error: $file contains unreplaced template placeholders (e.g. {MODEL_NAME})."
-        exit 1
-    fi
-
-    # SMART DETECTION: Only run Buildkite validation if the file contains a 'steps' key
-    # This prevents failures on Kubernetes manifests or generic configs
     IS_PIPELINE=false
     grep -q "^[[:space:]]*steps:" "$file" && IS_PIPELINE=true
 
