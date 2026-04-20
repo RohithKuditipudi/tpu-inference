@@ -20,18 +20,20 @@ set -euo pipefail
 RAW_FILES_TO_CHECK="${1:-}"
 BUILDKITE_DIR=".buildkite"
 
-# Replicate discovery logic for spec folders used in dynamic uploads
+# Directories that require strict reporting metadata and dynamic grouping
 declare -a SPEC_DIRS=("quantization" "parallelism" "models" "features" "rl")
 KERNEL_PARENT_DIR="$BUILDKITE_DIR/kernel_microbenchmarks"
 
+echo "--- 📂 Discovering spec directories"
 if [[ -d "$KERNEL_PARENT_DIR" ]]; then
     while IFS= read -r dir; do
         SPEC_DIRS+=("${dir#"$BUILDKITE_DIR"/}")
     done < <(find "$KERNEL_PARENT_DIR" -maxdepth 1 -mindepth 1 -type d)
 fi
 
-# We check ALL files in spec folders to ensure no internal ID collisions
-echo "--- Checking for duplicate pipeline-names and CI_TARGETs"
+# --- Global Uniqueness Enforcement ---
+# We scan ALL files in spec folders to prevent ID collisions in reporting
+echo "--- Checking for global metadata collisions"
 
 declare -A PIPELINE_NAMES
 declare -A CI_TARGETS
@@ -41,85 +43,98 @@ for folder in "${SPEC_DIRS[@]}"; do
     [[ ! -d "$full_path" ]] && continue
 
     while IFS= read -r -d '' file; do
-        # Extract pipeline-name
+        # Extract # pipeline-name: (Handles indentation and internal colons)
         P_NAME_LINE=$(awk '/^[[:space:]]*#[[:space:]]*pipeline-name:/ {print $0; exit}' "$file")
-        P_NAME="${P_NAME_LINE#*:}"
-        P_NAME="${P_NAME#"${P_NAME%%[![:space:]]*}"}"
-        P_NAME="${P_NAME%"${P_NAME##*[![:space:]]}"}"
+        P_NAME=$(echo "${P_NAME_LINE#*:}" | xargs)
 
         # Extract CI_TARGET
-        C_TARGET=$(grep -E "^[[:space:]]*CI_TARGET:" "$file" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'\' )
-        C_TARGET="${C_TARGET%"${C_TARGET##*[![:space:]]}"}"
+        C_TARGET_RAW=$(grep -E "^[[:space:]]*CI_TARGET:" "$file" | head -1 || true)
+        C_TARGET=$(echo "$C_TARGET_RAW" | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'\' | xargs)
 
-        # Check for pipeline-name duplicates
+        # Check for duplicate pipeline-names
         if [[ -n "$P_NAME" ]]; then
             if [[ -n "${PIPELINE_NAMES[$P_NAME]:-}" ]]; then
                 echo "+++ ❌ Error: Duplicate '# pipeline-name: $P_NAME' detected!"
-                echo "Conflict between: $file and ${PIPELINE_NAMES[$P_NAME]}"
+                echo "Conflict: $file and ${PIPELINE_NAMES[$P_NAME]}"
                 exit 1
             fi
             PIPELINE_NAMES["$P_NAME"]="$file"
         fi
 
-        # Check for CI_TARGET duplicates
+        # Check for duplicate CI_TARGETs
         if [[ -n "$C_TARGET" ]]; then
             if [[ -n "${CI_TARGETS[$C_TARGET]:-}" ]]; then
                 echo "+++ ❌ Error: Duplicate 'CI_TARGET: $C_TARGET' detected!"
-                echo "Conflict between: $file and ${CI_TARGETS[$C_TARGET]}"
+                echo "Conflict: $file and ${CI_TARGETS[$C_TARGET]}"
                 exit 1
             fi
             CI_TARGETS["$C_TARGET"]="$file"
         fi
-
     done < <(find "$full_path" -maxdepth 1 -type f \( -name "*.yml" -o -name "*.yaml" \) -print0)
 done
 
-# Per-File Validation (Changed Files Only)
+# Pre-filter: Only include .yml or .yaml files located within the .buildkite/ directory
+# Using '|| true' to prevent the script from exiting if no matches are found
+# This automatically ignores .github/, root level yamls, etc.
 YAML_FILES_TO_CHECK=$(echo "$RAW_FILES_TO_CHECK" | grep -E "^\.buildkite/.*\.ya?ml$" || true)
 
-if [ -z "$YAML_FILES_TO_CHECK" ]; then
-    echo "--- :crossed_fingers: No pipeline changes detected. Skipping file validation."
+# Early exit: If no YAML files were modified, skip validation
+if [[ -z "$YAML_FILES_TO_CHECK" ]]; then
+    echo "--- :crossed_fingers: No relevant YAML changes detected."
     exit 0
 fi
 
 VALIDATE_ARGS=()
-echo "--- 📂 Validating modified pipeline integrity"
+echo "--- 🔍 Validating changed pipeline integrity"
 
 while IFS= read -r file; do
-    [ -z "$file" ] && continue
-    [ ! -f "$file" ] && continue
+    [[ -z "$file" || ! -f "$file" ]] && continue
 
-    # Spec-Specific Metadata Presence Rules
+    # Rule: Prevent unreplaced placeholders from reaching CI
+    if grep -qE "\{[A-Z0-9_]+\}" "$file"; then
+        echo "+++ ❌ Error: $file contains unreplaced template placeholders (e.g. {MODEL_NAME})."
+        exit 1
+    fi
+
+    # SMART DETECTION: Only run Buildkite validation if the file contains a 'steps' key
+    # This prevents failures on Kubernetes manifests or generic configs
+    IS_PIPELINE=false
+    grep -q "^[[:space:]]*steps:" "$file" && IS_PIPELINE=true
+
+    # Determine if the file is in a spec directory for strict rule enforcement
     IS_SPEC=false
     for dir in "${SPEC_DIRS[@]}"; do
-        if [[ "$file" == "$BUILDKITE_DIR/$dir/"* ]]; then
-            IS_SPEC=true; break
+        if [[ "$file" == "$BUILDKITE_DIR/$dir/"* || "$file" == "./$BUILDKITE_DIR/$dir/"* ]]; then
+            IS_SPEC=true
+            break
         fi
     done
 
     if [[ "$IS_SPEC" == "true" ]]; then
-        # Rule: Spec files must have the 'pipeline-name' comment for upload metadata
+        # Rule: Specs MUST have valid pipeline-name metadata for reporting
         if ! grep -qiE "^[[:space:]]*#[[:space:]]*pipeline-name:[[:space:]]*.+" "$file"; then
-            echo "+++ ❌ Error: $file is missing a valid '# pipeline-name:' comment."
+            echo "+++ ❌ Error: $file is in a spec folder but is missing a valid '# pipeline-name:' comment."
             exit 1
         fi
-        
-        # Rule: Spec files must have 'steps:' for fragment stripping logic
-        if ! grep -q "^steps:" "$file"; then
-            echo "+++ ❌ Error: $file is missing the 'steps:' root key."
+        # Rule: Specs MUST be actual pipelines
+        if [[ "$IS_PIPELINE" == "false" ]]; then
+            echo "+++ ❌ Error: $file is in a spec folder but is missing the 'steps:' root key."
             exit 1
         fi
     fi
 
-    VALIDATE_ARGS+=("--file" "$file")
+    # Only add to Buildkite syntax list if it's actually a pipeline file
+    if [[ "$IS_PIPELINE" == "true" ]]; then
+        VALIDATE_ARGS+=("--file" "$file")
+    else
+        echo "--- ℹ️ Skipping Buildkite syntax check for non-pipeline YAML: $file"
+    fi
 done < <(echo "$YAML_FILES_TO_CHECK")
 
-echo "--- 🔍 Validating changed YAML files"
-if [ ${#VALIDATE_ARGS[@]} -gt 0 ]; then
-    if ! bk pipeline validate "${VALIDATE_ARGS[@]}"; then
-        echo "+++ ❌ Syntax Validation Failed"
-        exit 1
-    fi
+# --- Final Syntax Validation ---
+if [[ ${#VALIDATE_ARGS[@]} -gt 0 ]]; then
+    echo "--- 🧪 Running 'bk pipeline validate' for ${#VALIDATE_ARGS[@]} file(s)"
+    bk pipeline validate "${VALIDATE_ARGS[@]}"
 fi
 
 echo "+++ ✅ All validations successful"
