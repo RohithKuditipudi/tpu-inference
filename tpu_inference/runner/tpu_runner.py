@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import jaxtyping
 import numpy as np
+import torch
 import vllm.envs as vllm_envs
 from flax import nnx
 from jax.experimental import mesh_utils
@@ -225,13 +226,14 @@ def _jax_logprobs_to_lists(logprobs_tensors,
 
 def _materialize_prompt_logprobs(
         logprobs_tensors: LogprobsTensors) -> LogprobsTensors:
-    """Materialize prompt logprobs into host-backed arrays."""
+    """Materialize prompt logprobs into host-backed CPU torch tensors."""
     return LogprobsTensors(
-        logprob_token_ids=np.asarray(
-            jax.device_get(logprobs_tensors.logprob_token_ids)),
-        logprobs=np.asarray(jax.device_get(logprobs_tensors.logprobs)),
-        selected_token_ranks=np.asarray(
-            jax.device_get(logprobs_tensors.selected_token_ranks)),
+        logprob_token_ids=torch.from_numpy(
+            np.asarray(jax.device_get(logprobs_tensors.logprob_token_ids))),
+        logprobs=torch.from_numpy(
+            np.asarray(jax.device_get(logprobs_tensors.logprobs))),
+        selected_token_ranks=torch.from_numpy(
+            np.asarray(jax.device_get(logprobs_tensors.selected_token_ranks))),
     )
 
 
@@ -242,12 +244,11 @@ def _concat_prompt_logprobs(
     if len(chunks) == 1:
         return chunks[0]
     return LogprobsTensors(
-        logprob_token_ids=np.concatenate(
-            [np.asarray(chunk.logprob_token_ids) for chunk in chunks], axis=0),
-        logprobs=np.concatenate([np.asarray(chunk.logprobs) for chunk in chunks],
-                                axis=0),
-        selected_token_ranks=np.concatenate(
-            [np.asarray(chunk.selected_token_ranks) for chunk in chunks], axis=0),
+        logprob_token_ids=torch.cat(
+            [chunk.logprob_token_ids for chunk in chunks], dim=0),
+        logprobs=torch.cat([chunk.logprobs for chunk in chunks], dim=0),
+        selected_token_ranks=torch.cat(
+            [chunk.selected_token_ranks for chunk in chunks], dim=0),
     )
 
 
