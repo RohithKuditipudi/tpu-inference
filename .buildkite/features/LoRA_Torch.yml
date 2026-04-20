@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # pipeline-name: LoRA_Torch
+# test build
 # pipeline-type: feature support matrix
 steps:
   - label: "${TPU_VERSION:-tpu6e} Correctness tests for LoRA_Torch"

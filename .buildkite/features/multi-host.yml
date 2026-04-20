@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # pipeline-name: multi-host
+# test build
 # pipeline-type: feature support matrix
 steps: 
   - label: "${TPU_VERSION:-tpu7x} Correctness tests for multi-host"

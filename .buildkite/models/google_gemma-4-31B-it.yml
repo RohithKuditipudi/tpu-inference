@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # pipeline-name: google/gemma-4-31B-it
+# test build
 # pipeline-type: multimodal
 steps:
   - label: "${TPU_VERSION:-tpu6e} Unit tests for google/gemma-4-31B-it"

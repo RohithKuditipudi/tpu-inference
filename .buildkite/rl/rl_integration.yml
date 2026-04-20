@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # pipeline-name: rl_integration
+# test build
 # pipeline-type: rl support matrix
 # RL (Reinforcement Learning) integration tests verify features critical for
 # training-inference pipelines: HBM KV-cache delete/reinitialise, log-prob

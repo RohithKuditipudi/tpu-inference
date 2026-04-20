@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # pipeline-name: deepseek-ai/DeepSeek-OCR
+# test build
 # pipeline-type: multimodal
 steps:
   - label: "${TPU_VERSION:-tpu6e} Unit tests for deepseek-ai/DeepSeek-OCR"

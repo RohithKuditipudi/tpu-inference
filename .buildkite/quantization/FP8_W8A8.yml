@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # pipeline-name: FP8 W8A8
+# test build
 # pipeline-type: quantization support matrix
 steps:
   - label: "${TPU_VERSION:-tpu6e} Correctness tests for FP8 W8A8"
