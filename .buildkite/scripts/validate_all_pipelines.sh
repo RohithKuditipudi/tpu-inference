@@ -18,11 +18,11 @@ set -euo pipefail
 
 # Assign the first argument to a local variable
 RAW_FILES_TO_CHECK="${1:-}"
+BUILDKITE_DIR=".buildkite"
 
 # Pre-filter: Only include .yml or .yaml files located within the .buildkite/ directory
-# Using '|| true' to prevent the script from exiting if no matches are found
 # This automatically ignores .github/, root level yamls, etc.
-YAML_FILES_TO_CHECK=$(echo "$RAW_FILES_TO_CHECK" | grep -E "^\.buildkite/.*\.ya?ml$" || true)
+YAML_FILES_TO_CHECK=$(echo "$RAW_FILES_TO_CHECK" | grep -E "^\.buildkite/.*\.ya?ml$" | grep -v "kubernetes/" || true)
 
 # Early exit: If no YAML files were modified, skip validation
 if [ -z "$YAML_FILES_TO_CHECK" ]; then
@@ -30,16 +30,65 @@ if [ -z "$YAML_FILES_TO_CHECK" ]; then
     exit 0
 fi
 
+# Initialize associative arrays for uniqueness tracking
+declare -A PIPELINE_NAMES
+declare -A CI_TARGETS
+
+# --- Discover spec directories for uniqueness checks ---
+declare -a SPEC_DIRS=("quantization" "parallelism" "models" "features" "rl")
+KERNEL_PARENT_DIR="$BUILDKITE_DIR/kernel_microbenchmarks"
+
+echo "--- 📂 Discovering spec directories"
+if [[ -d "$KERNEL_PARENT_DIR" ]]; then
+    while IFS= read -r dir; do
+        # Add subdirectories under kernel_microbenchmarks to SPEC_DIRS
+        SPEC_DIRS+=("${dir#"$BUILDKITE_DIR"/}")
+    done < <(find "$KERNEL_PARENT_DIR" -maxdepth 1 -mindepth 1 -type d)
+fi
+
+# --- Perform Uniqueness Checks for pipeline-name and CI_TARGET in SPEC_DIRS ---
+echo "--- 🔍 Checking metadata uniqueness in spec folders"
+for folder in "${SPEC_DIRS[@]}"; do
+    full_path="$BUILDKITE_DIR/$folder"
+    [[ ! -d "$full_path" ]] && continue
+
+    while IFS= read -r -d '' file; do
+        # Extract pipeline-name from comment
+        P_NAME_LINE=$(awk '/^[[:space:]]*#[[:space:]]*pipeline-name:/ {print $0; exit}' "$file")
+        P_NAME=$(echo "${P_NAME_LINE#*:}" | xargs)
+
+        # Extract CI_TARGET value
+        C_TARGET_RAW=$(grep -E "^[[:space:]]*CI_TARGET:" "$file" | head -1 || true)
+        C_TARGET=$(echo "$C_TARGET_RAW" | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'\' | xargs)
+
+        if [[ -n "$P_NAME" ]]; then
+            if [[ -n "${PIPELINE_NAMES[$P_NAME]:-}" ]]; then
+                echo "+++ ❌ Error: Duplicate '# pipeline-name: $P_NAME' detected!"
+                echo "Conflict: $file and ${PIPELINE_NAMES[$P_NAME]}"
+                exit 1
+            fi
+            PIPELINE_NAMES["$P_NAME"]="$file"
+        fi
+
+        if [[ -n "$C_TARGET" ]]; then
+            if [[ -n "${CI_TARGETS[$C_TARGET]:-}" ]]; then
+                echo "+++ ❌ Error: Duplicate 'CI_TARGET: $C_TARGET' detected!"
+                echo "Conflict: $file and ${CI_TARGETS[$C_TARGET]}"
+                exit 1
+            fi
+            CI_TARGETS["$C_TARGET"]="$file"
+        fi
+    done < <(find "$full_path" -maxdepth 1 -type f \( -name "*.yml" -o -name "*.yaml" \) -print0)
+done
+
 VALIDATE_ARGS=()
 
 echo "--- 📂 Preparing files for validation"
 
 # Iterate through the list to build the arguments array and check file existence
 while IFS= read -r file; do
-    # Skip empty lines to prevent errors
     [ -z "$file" ] && continue
 
-    # Check if the file still exists (to handle deleted files in a PR)
     if [ ! -f "$file" ]; then
         echo "Skipping deleted file: $file"
         continue
