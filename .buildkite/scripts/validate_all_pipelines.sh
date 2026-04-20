@@ -104,13 +104,13 @@ while IFS= read -r file; do
     done
 
     if [[ "$IS_SPEC" == "true" ]]; then
-        # Rule: Spec files MUST have the comment for upload metadata
-        if ! grep -q "^# ?pipeline-name: .." "$file"; then
-            echo "+++ ❌ Error: $file is missing the required '# pipeline-name:' comment."
+        # Rule: Spec files must have the 'pipeline-name' comment for upload metadata
+        if ! grep -qiE "^[[:space:]]*#[[:space:]]*pipeline-name:[[:space:]]*.+" "$file"; then
+            echo "+++ ❌ Error: $file is missing a valid '# pipeline-name:' comment."
             exit 1
         fi
         
-        # Rule: Spec files MUST have 'steps:' for fragment stripping logic
+        # Rule: Spec files must have 'steps:' for fragment stripping logic
         if ! grep -q "^steps:" "$file"; then
             echo "+++ ❌ Error: $file is missing the 'steps:' root key."
             exit 1
