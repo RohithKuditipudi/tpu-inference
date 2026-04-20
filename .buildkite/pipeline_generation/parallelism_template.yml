@@ -14,7 +14,7 @@
 
 
 # pipeline-name: {FEATURE_NAME}
-# test build1
+# test build2
 # pipeline-type: {CATEGORY}
 steps:
   # --- Single-Host Tests ---

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # pipeline-name: Qwen/Qwen3.5-9B
-# test build1
+# test build2
 # pipeline-type: multimodal
 steps:
   - label: "${TPU_VERSION:-tpu6e} Unit tests for Qwen/Qwen3.5-9B"
