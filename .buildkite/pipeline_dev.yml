@@ -34,7 +34,7 @@
 # 1. On your branch, edit this file — use any demo step below as a starting point.
 # 2. Change the command, model, env vars, or queue as needed.
 # 3. Trigger the pipeline — only your branch's file is used.
-# test build2
+# test build1
 steps:
 
   # -----------------------------------------------------------------

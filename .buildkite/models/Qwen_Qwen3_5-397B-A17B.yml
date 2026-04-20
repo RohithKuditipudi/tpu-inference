@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # pipeline-name: Qwen/Qwen3.5-397B-A17B
-# test build2
+# test build1
 # pipeline-type: text-only
 steps:
   - label: "${TPU_VERSION:-tpu6e} Unit tests for Qwen/Qwen3.5-397B-A17B-FP8"
