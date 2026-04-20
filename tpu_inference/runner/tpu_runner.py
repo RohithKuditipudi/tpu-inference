@@ -1146,6 +1146,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     prompt_hidden_states,
                     lora_metadata,
                 )
+                prompt_logits = prompt_logits.astype(jnp.float32)
                 prompt_token_ids = jnp.asarray(
                     req_state.prompt_token_ids[start_tok:start_tok +
                                                num_prompt_logits],
