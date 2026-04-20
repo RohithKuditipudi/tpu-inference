@@ -61,6 +61,13 @@ for folder in "${SPEC_DIRS[@]}"; do
         C_TARGET_RAW=$(grep -E "^[[:space:]]*CI_TARGET:" "$file" | head -1 || true)
         C_TARGET=$(echo "$C_TARGET_RAW" | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'\' | xargs)
 
+        # Verify that the pipeline-name metadata exists and is not empty
+        if [[ -z "$P_NAME" ]]; then
+            echo "+++ ❌ Error: Missing or empty '# pipeline-name:' in $file"
+            exit 1
+        fi
+
+        # Check if the pipeline-name has already been used by another file
         if [[ -n "$P_NAME" ]]; then
             if [[ -n "${PIPELINE_NAMES[$P_NAME]:-}" ]]; then
                 echo "+++ ❌ Error: Duplicate '# pipeline-name: $P_NAME' detected!"
@@ -70,6 +77,13 @@ for folder in "${SPEC_DIRS[@]}"; do
             PIPELINE_NAMES["$P_NAME"]="$file"
         fi
 
+        # Verify that the CI_TARGET environment variable exists and is not empty
+        if [[ -z "$C_TARGET" ]]; then
+            echo "+++ ❌ Error: Missing or empty 'CI_TARGET:' in $file"
+            exit 1
+        fi
+
+        # Check if the CI_TARGET value has already been used by another file
         if [[ -n "$C_TARGET" ]]; then
             if [[ -n "${CI_TARGETS[$C_TARGET]:-}" ]]; then
                 echo "+++ ❌ Error: Duplicate 'CI_TARGET: $C_TARGET' detected!"
