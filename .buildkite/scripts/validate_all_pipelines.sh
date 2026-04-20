@@ -47,7 +47,7 @@ for folder in "${SPEC_DIRS[@]}"; do
         P_NAME="${P_NAME%"${P_NAME##*[![:space:]]}"}"
 
         # Extract CI_TARGET
-        C_TARGET=$(grep -E "CI_TARGET:" "$file" | head -1 | awk -F': ' '{print $2}' | tr -d '"'\' )
+        C_TARGET=$(grep -E "CI_TARGET:" "$file" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'\' )
         C_TARGET="${C_TARGET%"${C_TARGET##*[![:space:]]}"}"
 
         # Check for pipeline-name duplicates
