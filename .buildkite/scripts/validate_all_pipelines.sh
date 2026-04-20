@@ -42,12 +42,13 @@ for folder in "${SPEC_DIRS[@]}"; do
 
     while IFS= read -r -d '' file; do
         # Extract pipeline-name
-        P_NAME_LINE=$(awk '/^# ?pipeline-name:/ {print $0; exit}' "$file")
-        P_NAME="${P_NAME_LINE#*:[[:space:]]}"
+        P_NAME_LINE=$(awk '/^[[:space:]]*#[[:space:]]*pipeline-name:/ {print $0; exit}' "$file")
+        P_NAME="${P_NAME_LINE#*:}"
+        P_NAME="${P_NAME#"${P_NAME%%[![:space:]]*}"}"
         P_NAME="${P_NAME%"${P_NAME##*[![:space:]]}"}"
 
         # Extract CI_TARGET
-        C_TARGET=$(grep -E "CI_TARGET:" "$file" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'\' )
+        C_TARGET=$(grep -E "^[[:space:]]*CI_TARGET:" "$file" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'\' )
         C_TARGET="${C_TARGET%"${C_TARGET##*[![:space:]]}"}"
 
         # Check for pipeline-name duplicates
