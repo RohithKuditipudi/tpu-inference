@@ -29,66 +29,70 @@ if [ -z "$YAML_FILES_TO_CHECK" ]; then
     exit 0
 fi
 
-# Initialize arrays and maps for uniqueness checks
-VALIDATE_ARGS=()
+# Initialize associative arrays for uniqueness tracking
 declare -A PIPELINE_NAMES
 declare -A CI_TARGETS
 
-# 1. Discover spec directories
+# --- Define specific directories that require strict metadata checks (Spec Folders) ---
 declare -a SPEC_DIRS=("quantization" "parallelism" "models" "features" "rl")
 KERNEL_PARENT_DIR="$BUILDKITE_DIR/kernel_microbenchmarks"
 
+# Discover subdirectories under kernel_microbenchmarks and add them to SPEC_DIRS
 echo "--- 📂 Discovering spec directories"
 if [[ -d "$KERNEL_PARENT_DIR" ]]; then
     while IFS= read -r dir; do
-        # Extract relative path from .buildkite/
+        # Strip the .buildkite/ prefix to match the relative path format
         SPEC_DIRS+=("${dir#"$BUILDKITE_DIR"/}")
     done < <(find "$KERNEL_PARENT_DIR" -maxdepth 1 -mindepth 1 -type d)
 fi
 
-# 2. Perform Uniqueness Checks for pipeline-name and CI_TARGET
-echo "--- 🔍 Checking for duplicate pipeline names and CI targets"
+# --- Perform Uniqueness Checks for pipeline-name and CI_TARGET in SPEC_DIRS ---
+echo "--- 🔍 Checking metadata uniqueness in spec folders"
 for folder in "${SPEC_DIRS[@]}"; do
     full_path="$BUILDKITE_DIR/$folder"
+    
+    # Skip if the directory does not exist
     [[ ! -d "$full_path" ]] && continue
 
     while IFS= read -r -d '' file; do
-        # Only check files that define pipeline steps
-        if grep -q "^[[:space:]]*steps:" "$file"; then
-            # Extract # pipeline-name: value
-            P_NAME_LINE=$(awk '/^[[:space:]]*#[[:space:]]*pipeline-name:/ {print $0; exit}' "$file")
-            P_NAME=$(echo "${P_NAME_LINE#*:}" | xargs)
+        # Extract the line containing the pipeline-name comment
+        P_NAME_LINE=$(awk '/^[[:space:]]*#[[:space:]]*pipeline-name:/ {print $0; exit}' "$file")
+        P_NAME=$(echo "${P_NAME_LINE#*:}" | xargs)
 
-            # Extract CI_TARGET: value
-            C_TARGET_RAW=$(grep -E "^[[:space:]]*CI_TARGET:" "$file" | head -1 || true)
-            C_TARGET=$(echo "$C_TARGET_RAW" | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'\' | xargs)
+        # Extract the value of the CI_TARGET field
+        C_TARGET_RAW=$(grep -E "^[[:space:]]*CI_TARGET:" "$file" | head -1 || true)
+        C_TARGET=$(echo "$C_TARGET_RAW" | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'\' | xargs)
 
-            if [[ -n "$P_NAME" ]]; then
-                if [[ -n "${PIPELINE_NAMES[$P_NAME]:-}" ]]; then
-                    echo "+++ ❌ Error: Duplicate '# pipeline-name: $P_NAME' detected!"
-                    echo "Conflict: $file and ${PIPELINE_NAMES[$P_NAME]}"
-                    exit 1
-                fi
-                PIPELINE_NAMES["$P_NAME"]="$file"
+        # Validate pipeline-name uniqueness
+        if [[ -n "$P_NAME" ]]; then
+            if [[ -n "${PIPELINE_NAMES[$P_NAME]:-}" ]]; then
+                echo "+++ ❌ Error: Duplicate '# pipeline-name: $P_NAME' detected!"
+                echo "Conflict: $file and ${PIPELINE_NAMES[$P_NAME]}"
+                exit 1
             fi
+            PIPELINE_NAMES["$P_NAME"]="$file"
+        fi
 
-            if [[ -n "$C_TARGET" ]]; then
-                if [[ -n "${CI_TARGETS[$C_TARGET]:-}" ]]; then
-                    echo "+++ ❌ Error: Duplicate 'CI_TARGET: $C_TARGET' detected!"
-                    echo "Conflict: $file and ${CI_TARGETS[$C_TARGET]}"
-                    exit 1
-                fi
-                CI_TARGETS["$C_TARGET"]="$file"
+        # Validate CI_TARGET uniqueness
+        if [[ -n "$C_TARGET" ]]; then
+            if [[ -n "${CI_TARGETS[$C_TARGET]:-}" ]]; then
+                echo "+++ ❌ Error: Duplicate 'CI_TARGET: $C_TARGET' detected!"
+                echo "Conflict: $file and ${CI_TARGETS[$C_TARGET]}"
+                exit 1
             fi
+            CI_TARGETS["$C_TARGET"]="$file"
         fi
     done < <(find "$full_path" -maxdepth 1 -type f \( -name "*.yml" -o -name "*.yaml" \) -print0)
 done
 
-# 3. Build validation arguments for changed files
-echo "--- 📂 Preparing files for Buildkite validation"
+# --- Build arguments for Buildkite syntax validation for ALL changed .buildkite/ YAMLs ---
+VALIDATE_ARGS=()
+
+echo "--- 📂 Preparing changed files for validation"
 while IFS= read -r file; do
     [ -z "$file" ] && continue
 
+    # Ensure the file still exists (handles deleted files in PRs)
     if [ ! -f "$file" ]; then
         echo "Skipping deleted file: $file"
         continue
@@ -99,8 +103,8 @@ while IFS= read -r file; do
 
 done < <(echo "$YAML_FILES_TO_CHECK")
 
-# 4. Final Buildkite Pipeline Validation
-echo "--- 🔍 Validating changed YAML syntax"
+# --- Execute Buildkite Pipeline Validation ---
+echo "--- 🔍 Validating changed YAML files"
 if [ ${#VALIDATE_ARGS[@]} -gt 0 ]; then
     if ! bk pipeline validate "${VALIDATE_ARGS[@]}"; then
         echo "+++ ❌ Validation Failed"
