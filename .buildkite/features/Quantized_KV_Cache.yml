@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # pipeline-name: Quantized KV Cache
-# test build2
+# test build1
 # pipeline-type: kernel support matrix
 steps:
   - label: "${TPU_VERSION:-tpu6e} Correctness tests for Quantized KV Cache"
