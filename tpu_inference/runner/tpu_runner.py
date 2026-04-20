@@ -160,6 +160,7 @@ class ExecuteModelState:
     kv_connector_output: Optional[KVConnectorOutput]
     logits_indices_selector: Optional[List[int]] = None
     padded_num_reqs: Optional[int] = None
+    full_query_hidden_states: Optional[jax.Array] = None
 
 
 @functools.partial(jax.jit, donate_argnums=(0, 1, 2))
@@ -605,17 +606,19 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         (scheduler_output, attn_metadata, input_ids, hidden_states, logits,
          aux_hidden_states, spec_decode_metadata, kv_connector_output,
-         logits_indices_selector,
-         padded_num_reqs) = (self.execute_model_state.scheduler_output,
-                             self.execute_model_state.attn_metadata,
-                             self.execute_model_state.input_ids,
-                             self.execute_model_state.hidden_states,
-                             self.execute_model_state.logits,
-                             self.execute_model_state.aux_hidden_states,
-                             self.execute_model_state.spec_decode_metadata,
-                             self.execute_model_state.kv_connector_output,
-                             self.execute_model_state.logits_indices_selector,
-                             self.execute_model_state.padded_num_reqs)
+         logits_indices_selector, padded_num_reqs,
+         full_query_hidden_states) = (
+             self.execute_model_state.scheduler_output,
+             self.execute_model_state.attn_metadata,
+             self.execute_model_state.input_ids,
+             self.execute_model_state.hidden_states,
+             self.execute_model_state.logits,
+             self.execute_model_state.aux_hidden_states,
+             self.execute_model_state.spec_decode_metadata,
+             self.execute_model_state.kv_connector_output,
+             self.execute_model_state.logits_indices_selector,
+             self.execute_model_state.padded_num_reqs,
+             self.execute_model_state.full_query_hidden_states)
         self.execute_model_state = None
 
         if grammar_output is not None:
@@ -632,7 +635,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         return self._sample_from_logits(
             scheduler_output, attn_metadata, input_ids, hidden_states, logits,
             aux_hidden_states, spec_decode_metadata, kv_connector_output,
-            logits_indices_selector, padded_num_reqs)
+            logits_indices_selector, padded_num_reqs, full_query_hidden_states)
 
     def _modify_prev_results(self):
         # If copy to host has not been done, we just wait.
@@ -816,6 +819,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
                 return attn_metadata, hidden_states
+            full_query_hidden_states = None
+            if any(
+                    req_id in scheduler_output.num_scheduled_tokens
+                    and (req_state := self.requests[req_id]).sampling_params
+                    is not None
+                    and req_state.sampling_params.prompt_logprobs is not None
+                    for req_id in self.input_batch.req_ids[:self.input_batch
+                                                           .num_reqs]):
+                full_query_hidden_states = hidden_states
             hidden_states = self._select_from_array_fn(hidden_states,
                                                        logits_indices)
             logits = self.compute_logits_fn(
@@ -834,7 +846,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             spec_decode_metadata=spec_decode_metadata,
             kv_connector_output=kv_connector_output,
             logits_indices_selector=logits_indices_selector,
-            padded_num_reqs=padded_num_reqs)
+            padded_num_reqs=padded_num_reqs,
+            full_query_hidden_states=full_query_hidden_states)
         return attn_metadata, None
 
     def _sample_from_logits(
@@ -849,6 +862,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         kv_connector_output: Optional[KVConnectorOutput],
         logits_indices_selector: Optional[List[int]] = None,
         padded_num_reqs: Optional[int] = None,
+        full_query_hidden_states: Optional[jax.Array] = None,
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
         if padded_num_reqs is None:
             padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
@@ -902,11 +916,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 key=rejection_rng,
             )
 
-        prompt_logprobs_dict = self._get_prompt_logprobs_dict(
-            hidden_states,
-            scheduler_output,
-            attn_metadata,
-        )
+        prompt_logprobs_dict = {}
+        if full_query_hidden_states is not None:
+            prompt_logprobs_dict = self._get_prompt_logprobs_dict(
+                full_query_hidden_states,
+                scheduler_output,
+                attn_metadata,
+            )
 
         logits = logits.astype(jnp.float32)
         with self.maybe_forbid_compile:
