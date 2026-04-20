@@ -38,7 +38,7 @@ declare -A CI_TARGETS
 declare -a SPEC_DIRS=("quantization" "parallelism" "models" "features" "rl")
 KERNEL_PARENT_DIR="$BUILDKITE_DIR/kernel_microbenchmarks"
 
-echo "--- 📂 Discovering spec directories"
+echo "--- Discovering spec directories"
 if [[ -d "$KERNEL_PARENT_DIR" ]]; then
     while IFS= read -r dir; do
         # Add subdirectories under kernel_microbenchmarks to SPEC_DIRS
@@ -47,7 +47,7 @@ if [[ -d "$KERNEL_PARENT_DIR" ]]; then
 fi
 
 # --- Perform Uniqueness Checks for pipeline-name and CI_TARGET in SPEC_DIRS ---
-echo "--- 🔍 Checking metadata uniqueness in spec folders"
+echo "--- Checking metadata uniqueness in spec folders"
 for folder in "${SPEC_DIRS[@]}"; do
     full_path="$BUILDKITE_DIR/$folder"
     [[ ! -d "$full_path" ]] && continue

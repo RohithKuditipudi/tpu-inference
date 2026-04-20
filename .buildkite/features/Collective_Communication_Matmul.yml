@@ -28,7 +28,7 @@ steps:
     depends_on: "${TPU_VERSION:-tpu6e}_Collective_Communication_Matmul_CorrectnessTest"
     env:
       CI_TPU_VERSION: "${TPU_VERSION:-tpu6e}"
-      CI_TARGET: "Collective Communication Matmul"
+      CI_TARGET: "async scheduler"
       CI_STAGE: "CorrectnessTest"
       CI_CATEGORY: "kernel support matrix"
     agents:
