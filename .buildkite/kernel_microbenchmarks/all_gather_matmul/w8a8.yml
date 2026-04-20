@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # pipeline-name: all-gather-matmul-w8a8
-# test build1
+# test build2
 # pipeline-type: kernel support matrix microbenchmarks
 steps:
   - label: "${TPU_VERSION:-tpu6e} Correctness tests for all-gather-matmul-w8a8"

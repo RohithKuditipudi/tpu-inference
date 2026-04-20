@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # pipeline-name: mla-w8a16
-# test build1
+# test build2
 # pipeline-type: kernel support matrix microbenchmarks
 steps:
   - label: "${TPU_VERSION:-tpu6e} Correctness tests for mla-w8a16"
