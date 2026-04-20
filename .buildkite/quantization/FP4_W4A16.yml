@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # pipeline-name: FP4 W4A16
-# test build1
+# test build2
 # pipeline-type: quantization support matrix
 steps:
   - label: "${TPU_VERSION:-tpu6e} Correctness tests for FP4 W4A16"
