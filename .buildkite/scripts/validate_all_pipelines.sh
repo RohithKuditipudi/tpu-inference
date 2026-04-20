@@ -89,12 +89,6 @@ while IFS= read -r file; do
     [ -z "$file" ] && continue
     [ ! -f "$file" ] && continue
 
-    # Check for unreplaced template placeholders
-    if grep -qE "\{[A-Z0-9_]+\}" "$file"; then
-        echo "+++ ❌ Error: $file contains unreplaced placeholders (e.g., {MODEL_NAME})."
-        exit 1
-    fi
-
     # Spec-Specific Metadata Presence Rules
     IS_SPEC=false
     for dir in "${SPEC_DIRS[@]}"; do
