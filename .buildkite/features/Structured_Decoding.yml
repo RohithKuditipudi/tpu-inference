@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # pipeline-name: structured_decoding
-# test build2
+# test build1
 # pipeline-type: feature support matrix
 # Structured decoding allows constraining the model's output to follow a
 # specific format, such as choosing from a predefined set of options or
