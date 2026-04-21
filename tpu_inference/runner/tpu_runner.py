@@ -254,6 +254,17 @@ def _concat_prompt_logprobs(
     )
 
 
+def _slice_prompt_logprobs(
+        logprobs_tensors: LogprobsTensors,
+        num_positions: int) -> LogprobsTensors:
+    return LogprobsTensors(
+        logprob_token_ids=logprobs_tensors.logprob_token_ids[:num_positions],
+        logprobs=logprobs_tensors.logprobs[:num_positions],
+        selected_token_ranks=logprobs_tensors.selected_token_ranks[
+            :num_positions],
+    )
+
+
 class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def __init__(
@@ -1141,24 +1152,50 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
             if num_prompt_logits > 0:
                 offset = query_start_loc_cpu[req_idx]
+                padded_num_prompt_logits = runner_utils.get_padded_token_len(
+                    self.num_tokens_paddings, num_prompt_logits)
                 prompt_hidden_states = hidden_states[offset:offset +
                                                      num_prompt_logits]
-                prompt_logits = self.compute_logits_fn(
-                    self.state,
-                    prompt_hidden_states,
-                    lora_metadata,
-                )
+                if padded_num_prompt_logits != num_prompt_logits:
+                    prompt_hidden_states = jnp.zeros(
+                        (padded_num_prompt_logits,
+                         prompt_hidden_states.shape[-1]),
+                        dtype=prompt_hidden_states.dtype,
+                    ).at[:num_prompt_logits].set(prompt_hidden_states)
+                forbid_compile = (runner_utils.ForbidCompile(
+                    "prompt_logprobs.compute_logits_fn recompiled")
+                                  if envs.VLLM_XLA_CHECK_RECOMPILATION else
+                                  nullcontext())
+                with forbid_compile:
+                    prompt_logits = self.compute_logits_fn(
+                        self.state,
+                        prompt_hidden_states,
+                        lora_metadata,
+                    )
                 prompt_logits = prompt_logits.astype(jnp.float32)
-                prompt_token_ids = jnp.asarray(
+                prompt_token_ids = np.asarray(
                     req_state.prompt_token_ids[start_tok:start_tok +
                                                num_prompt_logits],
-                    dtype=jnp.int32,
+                    dtype=np.int32,
                 )
-                prompt_logprobs = self._compute_and_gather_logprobs(
-                    prompt_logits,
-                    prompt_token_ids,
-                    sampling_params.prompt_logprobs,
-                )
+                if padded_num_prompt_logits != num_prompt_logits:
+                    padded_prompt_token_ids = np.zeros(
+                        padded_num_prompt_logits, dtype=np.int32)
+                    padded_prompt_token_ids[:num_prompt_logits] = (
+                        prompt_token_ids)
+                    prompt_token_ids = padded_prompt_token_ids
+                forbid_compile = (runner_utils.ForbidCompile(
+                    "prompt_logprobs._compute_and_gather_logprobs recompiled")
+                                  if envs.VLLM_XLA_CHECK_RECOMPILATION else
+                                  nullcontext())
+                with forbid_compile:
+                    prompt_logprobs = self._compute_and_gather_logprobs(
+                        prompt_logits,
+                        jnp.asarray(prompt_token_ids, dtype=jnp.int32),
+                        sampling_params.prompt_logprobs,
+                    )
+                prompt_logprobs = _slice_prompt_logprobs(
+                    prompt_logprobs, num_prompt_logits)
                 req_state.in_progress_prompt_logprobs.append(
                     _materialize_prompt_logprobs(prompt_logprobs))
 
