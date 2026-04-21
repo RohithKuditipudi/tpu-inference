@@ -461,10 +461,16 @@ class CompilationManager:
     def _precompile_compute_logits(self) -> None:
         logger.info("Compiling compute_logits with different input shapes.")
         hsize = self.runner.model_config.get_hidden_size()
-        leading_shape = self.runner.num_reqs_paddings if not self.runner.speculative_config else self.runner.num_logits_paddings
+        if self.runner.speculative_config:
+            leading_shapes = self.runner.num_logits_paddings
+        else:
+            leading_shapes = list(self.runner.num_reqs_paddings)
+            if self.runner.cache_config.enable_prefix_caching_with_prompt_logprobs:
+                leading_shapes.extend(self.runner.num_tokens_paddings)
+            leading_shapes = sorted(set(leading_shapes))
         dp_sharding = NamedSharding(self.runner.mesh,
                                     PartitionSpec(ShardingAxisName.ATTN_DATA))
-        for num_reqs in leading_shape:
+        for num_reqs in leading_shapes:
             hidden_states = self._create_dummy_tensor(
                 (num_reqs, hsize), jnp.bfloat16, dp_sharding)
             with self.runner.maybe_select_dummy_loras(
@@ -556,7 +562,10 @@ class CompilationManager:
     def _precompile_gather_logprobs(self) -> None:
         logger.info("Compiling gather_logprobs with different input shapes.")
         hsize = self.runner.model_config.get_vocab_size()
-        for num_reqs in self.runner.num_reqs_paddings:
+        leading_shapes = list(self.runner.num_reqs_paddings)
+        if self.runner.cache_config.enable_prefix_caching_with_prompt_logprobs:
+            leading_shapes.extend(self.runner.num_tokens_paddings)
+        for num_reqs in sorted(set(leading_shapes)):
             logits_sharding = NamedSharding(
                 self.runner.mesh,
                 PartitionSpec(ShardingAxisName.MLP_DATA,

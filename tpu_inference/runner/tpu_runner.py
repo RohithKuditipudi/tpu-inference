@@ -161,7 +161,7 @@ class ExecuteModelState:
     kv_connector_output: Optional[KVConnectorOutput]
     logits_indices_selector: Optional[List[int]] = None
     padded_num_reqs: Optional[int] = None
-    full_query_hidden_states: Optional[jax.Array] = None
+    full_query_logits: Optional[jax.Array] = None
 
 
 @functools.partial(jax.jit, donate_argnums=(0, 1, 2))
@@ -262,6 +262,17 @@ def _slice_prompt_logprobs(
         logprobs=logprobs_tensors.logprobs[:num_positions],
         selected_token_ranks=logprobs_tensors.selected_token_ranks[
             :num_positions],
+    )
+
+
+def _slice_prompt_logprobs_width(
+        logprobs_tensors: LogprobsTensors,
+        num_tokens_per_position: int) -> LogprobsTensors:
+    return LogprobsTensors(
+        logprob_token_ids=logprobs_tensors.logprob_token_ids[
+            :, :num_tokens_per_position],
+        logprobs=logprobs_tensors.logprobs[:, :num_tokens_per_position],
+        selected_token_ranks=logprobs_tensors.selected_token_ranks,
     )
 
 
@@ -621,7 +632,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         (scheduler_output, attn_metadata, input_ids, hidden_states, logits,
          aux_hidden_states, spec_decode_metadata, kv_connector_output,
          logits_indices_selector, padded_num_reqs,
-         full_query_hidden_states) = (
+         full_query_logits) = (
              self.execute_model_state.scheduler_output,
              self.execute_model_state.attn_metadata,
              self.execute_model_state.input_ids,
@@ -632,7 +643,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
              self.execute_model_state.kv_connector_output,
              self.execute_model_state.logits_indices_selector,
              self.execute_model_state.padded_num_reqs,
-             self.execute_model_state.full_query_hidden_states)
+             self.execute_model_state.full_query_logits)
         self.execute_model_state = None
 
         if grammar_output is not None:
@@ -649,7 +660,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         return self._sample_from_logits(
             scheduler_output, attn_metadata, input_ids, hidden_states, logits,
             aux_hidden_states, spec_decode_metadata, kv_connector_output,
-            logits_indices_selector, padded_num_reqs, full_query_hidden_states)
+            logits_indices_selector, padded_num_reqs, full_query_logits)
 
     def _modify_prev_results(self):
         # If copy to host has not been done, we just wait.
@@ -833,22 +844,32 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
                 return attn_metadata, hidden_states
-            full_query_hidden_states = None
-            if any(
+            full_query_logits = None
+            needs_prompt_logprobs = any(
                     req_id in scheduler_output.num_scheduled_tokens
                     and (req_state := self.requests[req_id]).sampling_params
                     is not None
                     and req_state.sampling_params.prompt_logprobs is not None
                     for req_id in self.input_batch.req_ids[:self.input_batch
-                                                           .num_reqs]):
-                full_query_hidden_states = hidden_states
-            hidden_states = self._select_from_array_fn(hidden_states,
-                                                       logits_indices)
-            logits = self.compute_logits_fn(
-                self.state,
-                hidden_states,
-                lora_metadata,
-            )
+                                                           .num_reqs])
+            if needs_prompt_logprobs:
+                full_query_logits = self.compute_logits_fn(
+                    self.state,
+                    hidden_states,
+                    lora_metadata,
+                )
+                hidden_states = self._select_from_array_fn(hidden_states,
+                                                           logits_indices)
+                logits = self._select_from_array_fn(full_query_logits,
+                                                    logits_indices)
+            else:
+                hidden_states = self._select_from_array_fn(hidden_states,
+                                                           logits_indices)
+                logits = self.compute_logits_fn(
+                    self.state,
+                    hidden_states,
+                    lora_metadata,
+                )
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -861,7 +882,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             kv_connector_output=kv_connector_output,
             logits_indices_selector=logits_indices_selector,
             padded_num_reqs=padded_num_reqs,
-            full_query_hidden_states=full_query_hidden_states)
+            full_query_logits=full_query_logits)
         return attn_metadata, None
 
     def _sample_from_logits(
@@ -876,7 +897,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         kv_connector_output: Optional[KVConnectorOutput],
         logits_indices_selector: Optional[List[int]] = None,
         padded_num_reqs: Optional[int] = None,
-        full_query_hidden_states: Optional[jax.Array] = None,
+        full_query_logits: Optional[jax.Array] = None,
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
         if padded_num_reqs is None:
             padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
@@ -931,9 +952,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             )
 
         prompt_logprobs_dict = {}
-        if full_query_hidden_states is not None:
+        if full_query_logits is not None:
             prompt_logprobs_dict = self._get_prompt_logprobs_dict(
-                full_query_hidden_states,
+                full_query_logits,
                 scheduler_output,
                 attn_metadata,
             )
@@ -1116,15 +1137,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def _get_prompt_logprobs_dict(
         self,
-        hidden_states: jax.Array,
+        logits: jax.Array,
         scheduler_output: "VllmSchedulerOutput",
         attn_metadata: AttentionMetadata | dict[str, AttentionMetadata],
     ) -> dict[str, LogprobsTensors | None]:
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
-        lora_metadata = self.lora_utils.extract_lora_metadata()
         if isinstance(attn_metadata, dict):
             attn_metadata = next(iter(attn_metadata.values()))
         query_start_loc_cpu = attn_metadata.query_start_loc_cpu
+        batch_prompt_token_ids = np.zeros(logits.shape[0], dtype=np.int32)
+        prompt_row_ranges: dict[str, tuple[int, int, int]] = {}
+        max_prompt_logprobs = 0
 
         for req_idx, req_id in enumerate(
                 self.input_batch.req_ids[:self.input_batch.num_reqs]):
@@ -1152,53 +1175,61 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
             if num_prompt_logits > 0:
                 offset = query_start_loc_cpu[req_idx]
-                padded_num_prompt_logits = runner_utils.get_padded_token_len(
-                    self.num_tokens_paddings, num_prompt_logits)
-                prompt_hidden_states = hidden_states[offset:offset +
-                                                     num_prompt_logits]
-                if padded_num_prompt_logits != num_prompt_logits:
-                    prompt_hidden_states = jnp.zeros(
-                        (padded_num_prompt_logits,
-                         prompt_hidden_states.shape[-1]),
-                        dtype=prompt_hidden_states.dtype,
-                    ).at[:num_prompt_logits].set(prompt_hidden_states)
-                forbid_compile = (runner_utils.ForbidCompile(
-                    "prompt_logprobs.compute_logits_fn recompiled")
-                                  if envs.VLLM_XLA_CHECK_RECOMPILATION else
-                                  nullcontext())
-                with forbid_compile:
-                    prompt_logits = self.compute_logits_fn(
-                        self.state,
-                        prompt_hidden_states,
-                        lora_metadata,
-                    )
-                prompt_logits = prompt_logits.astype(jnp.float32)
                 prompt_token_ids = np.asarray(
                     req_state.prompt_token_ids[start_tok:start_tok +
                                                num_prompt_logits],
                     dtype=np.int32,
                 )
-                if padded_num_prompt_logits != num_prompt_logits:
-                    padded_prompt_token_ids = np.zeros(
-                        padded_num_prompt_logits, dtype=np.int32)
-                    padded_prompt_token_ids[:num_prompt_logits] = (
-                        prompt_token_ids)
-                    prompt_token_ids = padded_prompt_token_ids
-                forbid_compile = (runner_utils.ForbidCompile(
-                    "prompt_logprobs._compute_and_gather_logprobs recompiled")
-                                  if envs.VLLM_XLA_CHECK_RECOMPILATION else
-                                  nullcontext())
-                with forbid_compile:
-                    prompt_logprobs = self._compute_and_gather_logprobs(
-                        prompt_logits,
-                        jnp.asarray(prompt_token_ids, dtype=jnp.int32),
-                        sampling_params.prompt_logprobs,
-                    )
-                prompt_logprobs = _slice_prompt_logprobs(
-                    prompt_logprobs, num_prompt_logits)
-                req_state.in_progress_prompt_logprobs.append(
-                    _materialize_prompt_logprobs(prompt_logprobs))
+                batch_prompt_token_ids[offset:offset + num_prompt_logits] = (
+                    prompt_token_ids)
+                prompt_row_ranges[req_id] = (
+                    int(offset),
+                    int(num_prompt_logits),
+                    int(sampling_params.prompt_logprobs),
+                )
+                max_prompt_logprobs = max(max_prompt_logprobs,
+                                          int(sampling_params.prompt_logprobs))
 
+        batch_prompt_logprobs = None
+        if max_prompt_logprobs > 0:
+            forbid_compile = (runner_utils.ForbidCompile(
+                "prompt_logprobs._compute_and_gather_logprobs recompiled")
+                              if envs.VLLM_XLA_CHECK_RECOMPILATION else
+                              nullcontext())
+            with forbid_compile:
+                batch_prompt_logprobs = self._compute_and_gather_logprobs(
+                    logits.astype(jnp.float32),
+                    jnp.asarray(batch_prompt_token_ids, dtype=jnp.int32),
+                    max_prompt_logprobs,
+                )
+
+        for req_id, (offset, num_prompt_logits,
+                     num_prompt_logprobs) in prompt_row_ranges.items():
+            req_state = self.requests[req_id]
+            prompt_logprobs = LogprobsTensors(
+                logprob_token_ids=batch_prompt_logprobs.logprob_token_ids[
+                    offset:offset + num_prompt_logits],
+                logprobs=batch_prompt_logprobs.logprobs[offset:offset +
+                                                        num_prompt_logits],
+                selected_token_ranks=batch_prompt_logprobs.selected_token_ranks[
+                    offset:offset + num_prompt_logits],
+            )
+            if num_prompt_logprobs != max_prompt_logprobs:
+                prompt_logprobs = _slice_prompt_logprobs_width(
+                    prompt_logprobs, num_prompt_logprobs + 1)
+            req_state.in_progress_prompt_logprobs.append(
+                _materialize_prompt_logprobs(prompt_logprobs))
+
+        for req_id in self.input_batch.req_ids[:self.input_batch.num_reqs]:
+            if req_id is None or req_id not in scheduler_output.num_scheduled_tokens:
+                continue
+            req_state = self.requests[req_id]
+            sampling_params = req_state.sampling_params
+            if sampling_params is None or sampling_params.prompt_logprobs is None:
+                continue
+            num_prompt_tokens = req_state.num_prompt_tokens
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            start_idx = req_state.num_computed_tokens
             seq_len = start_idx + num_scheduled_tokens
             if seq_len >= num_prompt_tokens:
                 prompt_logprobs_dict[req_id] = _concat_prompt_logprobs(
