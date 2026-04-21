@@ -574,11 +574,9 @@ class CompilationManager:
         logger.info("Compiling gather_logprobs with different input shapes.")
         hsize = self.runner.model_config.get_vocab_size()
         leading_shapes = list(self.runner.num_reqs_paddings)
-        if self.runner.cache_config.enable_prefix_caching_with_prompt_logprobs:
-            leading_shapes.extend(self.runner.num_tokens_paddings)
+        leading_shapes.extend(self.runner.num_tokens_paddings)
         max_logprobs_values = {self.runner.model_config.max_logprobs}
-        if self.runner.cache_config.enable_prefix_caching_with_prompt_logprobs:
-            max_logprobs_values.add(1)
+        max_logprobs_values.add(1)
         for num_reqs in sorted(set(leading_shapes)):
             logits_sharding = NamedSharding(
                 self.runner.mesh,
