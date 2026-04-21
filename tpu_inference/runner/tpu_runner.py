@@ -229,11 +229,13 @@ def _materialize_prompt_logprobs(
     """Materialize prompt logprobs into host-backed CPU torch tensors."""
     return LogprobsTensors(
         logprob_token_ids=torch.from_numpy(
-            np.asarray(jax.device_get(logprobs_tensors.logprob_token_ids))),
+            np.array(jax.device_get(logprobs_tensors.logprob_token_ids),
+                     copy=True)),
         logprobs=torch.from_numpy(
-            np.asarray(jax.device_get(logprobs_tensors.logprobs))),
+            np.array(jax.device_get(logprobs_tensors.logprobs), copy=True)),
         selected_token_ranks=torch.from_numpy(
-            np.asarray(jax.device_get(logprobs_tensors.selected_token_ranks))),
+            np.array(jax.device_get(logprobs_tensors.selected_token_ranks),
+                     copy=True)),
     )
 
 
