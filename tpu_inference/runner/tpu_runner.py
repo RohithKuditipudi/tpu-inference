@@ -1192,13 +1192,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         batch_prompt_logprobs = None
         if max_prompt_logprobs > 0:
+            prompt_logits = logits.astype(jnp.float32)
             forbid_compile = (runner_utils.ForbidCompile(
                 "prompt_logprobs._compute_and_gather_logprobs recompiled")
                               if envs.VLLM_XLA_CHECK_RECOMPILATION else
                               nullcontext())
             with forbid_compile:
                 batch_prompt_logprobs = self._compute_and_gather_logprobs(
-                    logits.astype(jnp.float32),
+                    prompt_logits,
                     jnp.asarray(batch_prompt_token_ids, dtype=jnp.int32),
                     max_prompt_logprobs,
                 )

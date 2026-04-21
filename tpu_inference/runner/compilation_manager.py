@@ -584,7 +584,7 @@ class CompilationManager:
                               ShardingAxisName.MLP_TENSOR))
             token_ids_sharding = NamedSharding(
                 self.runner.mesh, PartitionSpec(ShardingAxisName.MLP_DATA, ))
-            logits = self._create_dummy_tensor((num_reqs, hsize), jnp.bfloat16,
+            logits = self._create_dummy_tensor((num_reqs, hsize), jnp.float32,
                                                logits_sharding)
             token_ids = self._create_dummy_tensor((num_reqs, ), jnp.int32,
                                                   token_ids_sharding)
