@@ -477,8 +477,7 @@ class CompilationManager:
             leading_shapes = self.runner.num_logits_paddings
         else:
             leading_shapes = list(self.runner.num_reqs_paddings)
-            if self.runner.cache_config.enable_prefix_caching_with_prompt_logprobs:
-                leading_shapes.extend(self.runner.num_tokens_paddings)
+            leading_shapes.extend(self.runner.num_tokens_paddings)
             leading_shapes = sorted(set(leading_shapes))
         dp_sharding = NamedSharding(self.runner.mesh,
                                     PartitionSpec(ShardingAxisName.ATTN_DATA))
