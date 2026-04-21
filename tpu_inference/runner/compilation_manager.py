@@ -577,6 +577,9 @@ class CompilationManager:
         leading_shapes = list(self.runner.num_reqs_paddings)
         if self.runner.cache_config.enable_prefix_caching_with_prompt_logprobs:
             leading_shapes.extend(self.runner.num_tokens_paddings)
+        max_logprobs_values = {self.runner.model_config.max_logprobs}
+        if self.runner.cache_config.enable_prefix_caching_with_prompt_logprobs:
+            max_logprobs_values.add(1)
         for num_reqs in sorted(set(leading_shapes)):
             logits_sharding = NamedSharding(
                 self.runner.mesh,
@@ -588,14 +591,15 @@ class CompilationManager:
                                                logits_sharding)
             token_ids = self._create_dummy_tensor((num_reqs, ), jnp.int32,
                                                   token_ids_sharding)
-            self._run_compilation(
-                f"worker{self.runner.rank} gather_logprobs",
-                self.runner._compute_and_gather_logprobs,
-                logits,
-                token_ids,
-                self.runner.model_config.max_logprobs,
-                num_reqs=num_reqs,
-            )
+            for max_logprobs in sorted(max_logprobs_values):
+                self._run_compilation(
+                    f"worker{self.runner.rank} gather_logprobs",
+                    self.runner._compute_and_gather_logprobs,
+                    logits,
+                    token_ids,
+                    max_logprobs,
+                    num_reqs=num_reqs,
+                )
 
         self._gather_logprobs_precompiled = True
 
