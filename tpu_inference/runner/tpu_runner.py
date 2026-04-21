@@ -227,15 +227,18 @@ def _jax_logprobs_to_lists(logprobs_tensors,
 def _materialize_prompt_logprobs(
         logprobs_tensors: LogprobsTensors) -> LogprobsTensors:
     """Materialize prompt logprobs into host-backed CPU torch tensors."""
+    jax.copy_to_host_async(logprobs_tensors.logprob_token_ids)
+    jax.copy_to_host_async(logprobs_tensors.logprobs)
+    jax.copy_to_host_async(logprobs_tensors.selected_token_ranks)
+    logprob_token_ids, logprobs, selected_token_ranks = jax.device_get((
+        logprobs_tensors.logprob_token_ids,
+        logprobs_tensors.logprobs,
+        logprobs_tensors.selected_token_ranks,
+    ))
     return LogprobsTensors(
-        logprob_token_ids=torch.from_numpy(
-            np.array(jax.device_get(logprobs_tensors.logprob_token_ids),
-                     copy=True)),
-        logprobs=torch.from_numpy(
-            np.array(jax.device_get(logprobs_tensors.logprobs), copy=True)),
-        selected_token_ranks=torch.from_numpy(
-            np.array(jax.device_get(logprobs_tensors.selected_token_ranks),
-                     copy=True)),
+        logprob_token_ids=torch.from_numpy(logprob_token_ids),
+        logprobs=torch.from_numpy(logprobs),
+        selected_token_ranks=torch.from_numpy(selected_token_ranks),
     )
 
 
@@ -1210,6 +1213,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     prompt_token_ids,
                     max_prompt_logprobs,
                 )
+            batch_prompt_logprobs = _materialize_prompt_logprobs(
+                batch_prompt_logprobs)
 
         for req_id, (offset, num_prompt_logits,
                      num_prompt_logprobs) in prompt_row_ranges.items():
