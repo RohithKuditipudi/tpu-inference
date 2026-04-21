@@ -17,8 +17,11 @@ import jax.numpy as jnp
 import numpy as np
 from vllm.v1.outputs import LogprobsTensors
 
-from tpu_inference.layers.jax.sample.sampling import (compute_logprobs,
-                                                      gather_logprobs)
+from tpu_inference.layers.jax.sample.sampling import (
+    compute_logprobs,
+    gather_logprobs,
+    gather_logprobs_from_logits,
+)
 
 
 class TestSampling:
@@ -113,3 +116,24 @@ class TestSampling:
         assert result.logprob_token_ids[0, 0] == 1
         top_k_indices = sorted(result.logprob_token_ids[0, 1:].tolist())
         assert top_k_indices == [0, 1, 2] or top_k_indices == [0, 1, 3]
+
+    def test_gather_logprobs_from_logits_fast_path(self):
+        logits = jnp.array(
+            [
+                [1.0, 2.0, 3.0, 0.0],
+                [3.0, 2.0, 1.0, 0.0],
+            ],
+            dtype=jnp.float32,
+        )
+        token_ids = jnp.array([2, 0], dtype=jnp.int32)
+
+        result: LogprobsTensors = gather_logprobs_from_logits(
+            logits, token_ids, 1)
+        expected: LogprobsTensors = gather_logprobs(
+            compute_logprobs(logits), token_ids, 1)
+
+        assert np.array_equal(result.logprob_token_ids,
+                              expected.logprob_token_ids)
+        assert np.allclose(result.logprobs, expected.logprobs, atol=1e-6)
+        assert np.array_equal(result.selected_token_ranks,
+                              expected.selected_token_ranks)

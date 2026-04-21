@@ -67,6 +67,36 @@ def compute_logprobs(logits: jax.Array) -> jax.Array:
     return jax.nn.log_softmax(logits, axis=-1)
 
 
+def gather_logprobs_from_logits(
+    logits: jax.Array,
+    token_ids: jax.Array,
+    num_logprobs: int,
+) -> LogprobsTensors:
+    """Gather prompt/sample logprobs directly from logits.
+
+    For ``num_logprobs == 1`` this avoids materializing the full log-softmax
+    tensor and avoids ``top_k``. For larger values it falls back to the
+    logprobs-based implementation.
+    """
+    if num_logprobs != 1:
+        return gather_logprobs(compute_logprobs(logits), token_ids, num_logprobs)
+
+    token_ids = jnp.expand_dims(token_ids, axis=-1)
+    token_logits = jnp.take_along_axis(logits, token_ids, axis=-1)
+    normalizers = jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
+
+    top1_indices = jnp.argmax(logits, axis=-1, keepdims=True)
+    top1_logits = jnp.max(logits, axis=-1, keepdims=True)
+
+    token_logprobs = token_logits - normalizers
+    top1_logprobs = top1_logits - normalizers
+    token_ranks = jnp.sum(logits >= token_logits, axis=-1)
+
+    indices = jnp.concatenate((token_ids, top1_indices), axis=1)
+    logprobs = jnp.concatenate((token_logprobs, top1_logprobs), axis=1)
+    return LogprobsTensors(jnp.int32(indices), logprobs, token_ranks)
+
+
 def gather_logprobs(
     logprobs: jax.Array,
     token_ids: jax.Array,
