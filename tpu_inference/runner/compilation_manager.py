@@ -417,6 +417,7 @@ class CompilationManager:
     def _precompile_select_from_array(self) -> None:
         logger.info("Compiling select_from_array with different input shapes.")
         hsize = self.runner.model_config.get_hidden_size()
+        vocab_size = self.runner.model_config.get_vocab_size()
 
         if self.runner.speculative_config:
             index_paddings = self.runner.num_logits_paddings
@@ -435,9 +436,20 @@ class CompilationManager:
             input_sharding=hidden_states_sharding,
             indices_sharding=dp_sharding if dp_size > 1 else None,
         )
+        logits_sharding = NamedSharding(
+            self.runner.mesh,
+            PartitionSpec(ShardingAxisName.MLP_DATA,
+                          ShardingAxisName.MLP_TENSOR))
+        self._precompile_select_from_array_helper(
+            name=f"worker{self.runner.rank} select sampled logits",
+            source_paddings=self.runner.num_tokens_paddings,
+            indices_paddings=self.runner.num_reqs_paddings,
+            hidden_dim=vocab_size,
+            input_sharding=logits_sharding,
+            indices_sharding=dp_sharding if dp_size > 1 else None,
+        )
 
         if self.runner.speculative_config:
-            vocab_size = self.runner.model_config.get_vocab_size()
             self._precompile_select_from_array_helper(
                 name=
                 f"worker{self.runner.rank} select bonus tokens for spec decoding",
