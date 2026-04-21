@@ -1193,6 +1193,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         batch_prompt_logprobs = None
         if max_prompt_logprobs > 0:
             prompt_logits = logits.astype(jnp.float32)
+            token_ids_sharding = NamedSharding(
+                self.mesh, PartitionSpec(ShardingAxisName.MLP_DATA, ))
+            prompt_token_ids = device_array(
+                self.mesh,
+                batch_prompt_token_ids,
+                sharding=token_ids_sharding,
+            )
             forbid_compile = (runner_utils.ForbidCompile(
                 "prompt_logprobs._compute_and_gather_logprobs recompiled")
                               if envs.VLLM_XLA_CHECK_RECOMPILATION else
@@ -1200,7 +1207,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             with forbid_compile:
                 batch_prompt_logprobs = self._compute_and_gather_logprobs(
                     prompt_logits,
-                    jnp.asarray(batch_prompt_token_ids, dtype=jnp.int32),
+                    prompt_token_ids,
                     max_prompt_logprobs,
                 )
 
