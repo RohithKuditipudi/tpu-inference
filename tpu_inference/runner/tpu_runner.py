@@ -228,18 +228,19 @@ def _jax_logprobs_to_lists(logprobs_tensors,
     )
 
 
-def _materialize_prompt_logprobs(
+def _materialize_batch_prompt_logprobs(
         logprobs_tensors: LogprobsTensors) -> LogprobsTensors:
-    """Materialize prompt logprobs into host-backed CPU torch tensors."""
+    """Materialize a batch of prompt logprobs once before per-request slicing."""
+    host_logprob_token_ids = np.array(
+        jax.device_get(logprobs_tensors.logprob_token_ids), copy=True)
+    host_logprobs = np.array(jax.device_get(logprobs_tensors.logprobs),
+                             copy=True)
+    host_selected_token_ranks = np.array(
+        jax.device_get(logprobs_tensors.selected_token_ranks), copy=True)
     return LogprobsTensors(
-        logprob_token_ids=torch.from_numpy(
-            np.array(jax.device_get(logprobs_tensors.logprob_token_ids),
-                     copy=True)),
-        logprobs=torch.from_numpy(
-            np.array(jax.device_get(logprobs_tensors.logprobs), copy=True)),
-        selected_token_ranks=torch.from_numpy(
-            np.array(jax.device_get(logprobs_tensors.selected_token_ranks),
-                     copy=True)),
+        logprob_token_ids=torch.from_numpy(host_logprob_token_ids),
+        logprobs=torch.from_numpy(host_logprobs),
+        selected_token_ranks=torch.from_numpy(host_selected_token_ranks),
     )
 
 
@@ -1217,6 +1218,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     prompt_token_ids,
                     max_prompt_logprobs,
                 )
+            batch_prompt_logprobs = _materialize_batch_prompt_logprobs(
+                batch_prompt_logprobs)
 
         for req_id, (offset, num_prompt_logits,
                      num_prompt_logprobs) in prompt_row_ranges.items():
@@ -1232,8 +1235,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             if num_prompt_logprobs != max_prompt_logprobs:
                 prompt_logprobs = _slice_prompt_logprobs_width(
                     prompt_logprobs, num_prompt_logprobs + 1)
-            req_state.in_progress_prompt_logprobs.append(
-                _materialize_prompt_logprobs(prompt_logprobs))
+            req_state.in_progress_prompt_logprobs.append(prompt_logprobs)
 
         for req_id in self.input_batch.req_ids[:self.input_batch.num_reqs]:
             if req_id is None or req_id not in scheduler_output.num_scheduled_tokens:
