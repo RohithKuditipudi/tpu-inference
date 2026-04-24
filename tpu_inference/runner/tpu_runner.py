@@ -971,7 +971,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 logits = processed_logits if self.model_config.logprobs_mode == "processed_logprobs" else logits
                 logprobs = self._compute_and_gather_logprobs(
                     logits, next_tokens, self.model_config.max_logprobs)
-                logprobs = _jax_logprobs_copy_to_host_async(logprobs)
             else:
                 logprobs = None
 
