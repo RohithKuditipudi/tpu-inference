@@ -481,8 +481,9 @@ class CompilationManager:
             leading_shapes = list(self.runner.num_reqs_paddings)
             leading_shapes.extend(self.runner.num_tokens_paddings)
             leading_shapes = sorted(set(leading_shapes))
-        dp_sharding = NamedSharding(self.runner.mesh,
-                                    PartitionSpec(ShardingAxisName.ATTN_DATA))
+        dp_sharding = NamedSharding(
+            self.runner.mesh,
+            PartitionSpec(ShardingAxisName.ATTN_DATA, None))
         for num_reqs in leading_shapes:
             hidden_states = self._create_dummy_tensor(
                 (num_reqs, hsize), jnp.bfloat16, dp_sharding)
