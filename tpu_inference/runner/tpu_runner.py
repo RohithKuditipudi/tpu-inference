@@ -858,15 +858,31 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     for req_id in self.input_batch.req_ids[:self.input_batch
                                                            .num_reqs])
             if needs_prompt_logprobs:
-                full_query_logits = self.compute_logits_fn(
-                    self.state,
-                    hidden_states,
-                    lora_metadata,
-                )
-                hidden_states = self._select_from_array_fn(hidden_states,
-                                                           logits_indices)
-                logits = self._select_from_array_fn(full_query_logits,
-                                                    logits_indices)
+                compute_logits_guard = (runner_utils.ForbidCompile(
+                    "prompt_logprobs.compute_logits_fn recompiled")
+                                       if envs.VLLM_XLA_CHECK_RECOMPILATION else
+                                       nullcontext())
+                with compute_logits_guard:
+                    full_query_logits = self.compute_logits_fn(
+                        self.state,
+                        hidden_states,
+                        lora_metadata,
+                    )
+                select_hidden_states_guard = (runner_utils.ForbidCompile(
+                    "prompt_logprobs.select_hidden_states recompiled")
+                                              if envs.
+                                              VLLM_XLA_CHECK_RECOMPILATION else
+                                              nullcontext())
+                with select_hidden_states_guard:
+                    hidden_states = self._select_from_array_fn(hidden_states,
+                                                               logits_indices)
+                select_logits_guard = (runner_utils.ForbidCompile(
+                    "prompt_logprobs.select_logits recompiled")
+                                       if envs.VLLM_XLA_CHECK_RECOMPILATION else
+                                       nullcontext())
+                with select_logits_guard:
+                    logits = self._select_from_array_fn(full_query_logits,
+                                                        logits_indices)
             else:
                 hidden_states = self._select_from_array_fn(hidden_states,
                                                            logits_indices)
@@ -1199,7 +1215,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         batch_prompt_logprobs = None
         if max_prompt_logprobs > 0:
-            prompt_logits = logits.astype(jnp.float32)
+            cast_guard = (runner_utils.ForbidCompile(
+                "prompt_logprobs.cast_logits_float32 recompiled")
+                          if envs.VLLM_XLA_CHECK_RECOMPILATION else
+                          nullcontext())
+            with cast_guard:
+                prompt_logits = logits.astype(jnp.float32)
             token_ids_sharding = NamedSharding(
                 self.mesh, PartitionSpec(ShardingAxisName.MLP_DATA, ))
             prompt_token_ids = device_array(
