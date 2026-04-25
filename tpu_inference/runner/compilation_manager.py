@@ -611,8 +611,10 @@ class CompilationManager:
         vocab_size = self.runner.model_config.get_vocab_size()
         hidden_states_sharding = NamedSharding(
             self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None))
-        indices_sharding = NamedSharding(
-            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None))
+        dp_size = self.runner.vllm_config.sharding_config.total_dp_size
+        indices_sharding = (NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+                            if dp_size > 1 else None)
         token_ids_sharding = NamedSharding(
             self.runner.mesh, PartitionSpec(ShardingAxisName.MLP_DATA, ))
         for num_tokens in self.runner.num_tokens_paddings:
