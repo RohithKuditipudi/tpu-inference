@@ -305,8 +305,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self.devices = devices
         self.dtype = self.model_config.dtype
-        self.maybe_forbid_compile = runner_utils.ForbidCompile(
-        ) if envs.VLLM_XLA_CHECK_RECOMPILATION else nullcontext()
         self.dp_size = self.vllm_config.sharding_config.total_dp_size
         self.rank = rank
         self.is_first_rank = is_first_rank
@@ -822,64 +820,57 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # TODO: make _get_input_ids_embeds within this context
         # NOTE: right now, mm model will use embeddings as the input,
         # but text-only model will use input_ids
-        with self.maybe_forbid_compile:
-
-            with set_forward_context(
-                    None,
-                    self.vllm_config,
-            ), self.maybe_get_kv_connector_output(
-                    scheduler_output) as kv_connector_output:
-                # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
-                # but one of them would be `None`
-                (self.kv_caches, hidden_states,
-                 aux_hidden_states) = self.model_fn(
-                     self.state,
-                     self.kv_caches,
-                     input_ids,
-                     attn_metadata,
-                     inputs_embeds,
-                     input_positions,
-                     tuple(self.layer_name_to_kvcache_index.items()),
-                     lora_metadata,
-                     intermediate_tensors,
-                     self.is_first_rank,
-                     self.is_last_rank,
-                 )
-            if not get_pp_group().is_last_rank:
-                assert isinstance(hidden_states, JaxIntermediateTensors)
-                hidden_states.kv_connector_output = kv_connector_output
-                return attn_metadata, hidden_states
-            full_query_logits = None
-            needs_prompt_logprobs = any(
-                    req_id in scheduler_output.num_scheduled_tokens
-                    and (req_state := self.requests[req_id]).sampling_params
-                    is not None
-                    and req_state.sampling_params.prompt_logprobs is not None
-                    for req_id in self.input_batch.req_ids[:self.input_batch
-                                                           .num_reqs])
-            if needs_prompt_logprobs:
-                compute_logits_guard = (runner_utils.ForbidCompile(
-                    "prompt_logprobs.compute_logits_fn recompiled")
-                                       if envs.VLLM_XLA_CHECK_RECOMPILATION else
-                                       nullcontext())
-                with compute_logits_guard:
-                    full_query_logits = self.compute_logits_fn(
-                        self.state,
-                        hidden_states,
-                        lora_metadata,
-                    )
-                hidden_states = self._select_from_array_fn(hidden_states,
-                                                           logits_indices)
-                logits = self._select_from_array_fn(full_query_logits,
-                                                    logits_indices)
-            else:
-                hidden_states = self._select_from_array_fn(hidden_states,
-                                                           logits_indices)
-                logits = self.compute_logits_fn(
-                    self.state,
-                    hidden_states,
-                    lora_metadata,
-                )
+        with set_forward_context(
+                None,
+                self.vllm_config,
+        ), self.maybe_get_kv_connector_output(
+                scheduler_output) as kv_connector_output:
+            # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
+            # but one of them would be `None`
+            (self.kv_caches, hidden_states,
+             aux_hidden_states) = self.model_fn(
+                 self.state,
+                 self.kv_caches,
+                 input_ids,
+                 attn_metadata,
+                 inputs_embeds,
+                 input_positions,
+                 tuple(self.layer_name_to_kvcache_index.items()),
+                 lora_metadata,
+                 intermediate_tensors,
+                 self.is_first_rank,
+                 self.is_last_rank,
+             )
+        if not get_pp_group().is_last_rank:
+            assert isinstance(hidden_states, JaxIntermediateTensors)
+            hidden_states.kv_connector_output = kv_connector_output
+            return attn_metadata, hidden_states
+        full_query_logits = None
+        needs_prompt_logprobs = any(
+                req_id in scheduler_output.num_scheduled_tokens
+                and (req_state := self.requests[req_id]).sampling_params
+                is not None
+                and req_state.sampling_params.prompt_logprobs is not None
+                for req_id in self.input_batch.req_ids[:self.input_batch
+                                                       .num_reqs])
+        if needs_prompt_logprobs:
+            full_query_logits = self.compute_logits_fn(
+                self.state,
+                hidden_states,
+                lora_metadata,
+            )
+            hidden_states = self._select_from_array_fn(hidden_states,
+                                                       logits_indices)
+            logits = self._select_from_array_fn(full_query_logits,
+                                                logits_indices)
+        else:
+            hidden_states = self._select_from_array_fn(hidden_states,
+                                                       logits_indices)
+            logits = self.compute_logits_fn(
+                self.state,
+                hidden_states,
+                lora_metadata,
+            )
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -970,14 +961,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             )
 
         logits = logits.astype(jnp.float32)
-        with self.maybe_forbid_compile:
-
-            if tpu_sampling_metadata.logprobs:
-                logits = processed_logits if self.model_config.logprobs_mode == "processed_logprobs" else logits
-                logprobs = self._compute_and_gather_logprobs(
-                    logits, next_tokens, self.model_config.max_logprobs)
-            else:
-                logprobs = None
+        if tpu_sampling_metadata.logprobs:
+            logits = processed_logits if self.model_config.logprobs_mode == "processed_logprobs" else logits
+            logprobs = self._compute_and_gather_logprobs(
+                logits, next_tokens, self.model_config.max_logprobs)
+        else:
+            logprobs = None
 
         num_reqs = self.input_batch.num_reqs
 
@@ -1101,15 +1090,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logprobs_lists = None
 
         if self.speculative_config:
-            with self.maybe_forbid_compile:
-                self.speculative_decoding_manager.propose_draft_token_ids(
-                    valid_sampled_token_ids,
-                    aux_hidden_states,
-                    attn_metadata,
-                    spec_decode_metadata,
-                    scheduler_output,
-                    input_ids,
-                )
+            self.speculative_decoding_manager.propose_draft_token_ids(
+                valid_sampled_token_ids,
+                aux_hidden_states,
+                attn_metadata,
+                spec_decode_metadata,
+                scheduler_output,
+                input_ids,
+            )
 
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids,
@@ -1212,16 +1200,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 batch_prompt_token_ids,
                 sharding=token_ids_sharding,
             )
-            forbid_compile = (runner_utils.ForbidCompile(
-                "prompt_logprobs._compute_and_gather_logprobs recompiled")
-                              if envs.VLLM_XLA_CHECK_RECOMPILATION else
-                              nullcontext())
-            with forbid_compile:
-                batch_prompt_logprobs = self._compute_and_gather_logprobs(
-                    prompt_logits,
-                    prompt_token_ids,
-                    max_prompt_logprobs,
-                )
+            batch_prompt_logprobs = self._compute_and_gather_logprobs(
+                prompt_logits,
+                prompt_token_ids,
+                max_prompt_logprobs,
+            )
             batch_prompt_logprobs = _materialize_batch_prompt_logprobs(
                 batch_prompt_logprobs)
 
@@ -1401,12 +1384,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
              self.mesh, (padded_token_in_tpu_cur_input_indices,
                          padded_token_in_tpu_pre_next_tokens_indices))
 
-        with self.maybe_forbid_compile:
-            input_ids = self._substitute_placeholder_token_fn(
-                input_ids, padded_token_in_tpu_cur_input_indices,
-                padded_token_in_tpu_pre_next_tokens_indices,
-                self._pre_async_results.next_tokens,
-                len(token_in_tpu_cur_input_indices))
+        input_ids = self._substitute_placeholder_token_fn(
+            input_ids, padded_token_in_tpu_cur_input_indices,
+            padded_token_in_tpu_pre_next_tokens_indices,
+            self._pre_async_results.next_tokens,
+            len(token_in_tpu_cur_input_indices))
 
         return input_ids
 
