@@ -868,21 +868,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                         hidden_states,
                         lora_metadata,
                     )
-                select_hidden_states_guard = (runner_utils.ForbidCompile(
-                    "prompt_logprobs.select_hidden_states recompiled")
-                                              if envs.
-                                              VLLM_XLA_CHECK_RECOMPILATION else
-                                              nullcontext())
-                with select_hidden_states_guard:
-                    hidden_states = self._select_from_array_fn(hidden_states,
-                                                               logits_indices)
-                select_logits_guard = (runner_utils.ForbidCompile(
-                    "prompt_logprobs.select_logits recompiled")
-                                       if envs.VLLM_XLA_CHECK_RECOMPILATION else
-                                       nullcontext())
-                with select_logits_guard:
-                    logits = self._select_from_array_fn(full_query_logits,
-                                                        logits_indices)
+                hidden_states = self._select_from_array_fn(hidden_states,
+                                                           logits_indices)
+                logits = self._select_from_array_fn(full_query_logits,
+                                                    logits_indices)
             else:
                 hidden_states = self._select_from_array_fn(hidden_states,
                                                            logits_indices)
@@ -1215,12 +1204,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         batch_prompt_logprobs = None
         if max_prompt_logprobs > 0:
-            cast_guard = (runner_utils.ForbidCompile(
-                "prompt_logprobs.cast_logits_float32 recompiled")
-                          if envs.VLLM_XLA_CHECK_RECOMPILATION else
-                          nullcontext())
-            with cast_guard:
-                prompt_logits = logits.astype(jnp.float32)
+            prompt_logits = logits.astype(jnp.float32)
             token_ids_sharding = NamedSharding(
                 self.mesh, PartitionSpec(ShardingAxisName.MLP_DATA, ))
             prompt_token_ids = device_array(
