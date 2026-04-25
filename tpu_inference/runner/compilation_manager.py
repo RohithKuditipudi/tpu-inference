@@ -424,8 +424,9 @@ class CompilationManager:
             index_paddings = self.runner.num_logits_paddings
         else:
             index_paddings = self.runner.num_reqs_paddings
-        dp_sharding = NamedSharding(self.runner.mesh,
-                                    PartitionSpec(ShardingAxisName.ATTN_DATA))
+        dp_sharding = NamedSharding(
+            self.runner.mesh,
+            PartitionSpec(ShardingAxisName.ATTN_DATA, None))
         hidden_states_sharding = NamedSharding(
             self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None))
         dp_size = self.runner.vllm_config.sharding_config.total_dp_size
@@ -608,7 +609,7 @@ class CompilationManager:
         hidden_size = self.runner.model_config.get_hidden_size()
         vocab_size = self.runner.model_config.get_vocab_size()
         hidden_states_sharding = NamedSharding(
-            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None))
         logits_sharding = NamedSharding(
             self.runner.mesh,
             PartitionSpec(ShardingAxisName.MLP_DATA,
