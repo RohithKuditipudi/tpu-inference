@@ -109,6 +109,7 @@ class CompilationManager:
             # Skip gather_logprobs if already precompiled before KV cache allocation
             if not self._gather_logprobs_precompiled:
                 self._precompile_gather_logprobs()
+            self._precompile_apc_prompt_logprobs_suffix()
             self._precompile_structured_decoding()
             if self.runner.speculative_config:
                 self._precompile_speculative_decoding()
@@ -599,6 +600,49 @@ class CompilationManager:
                 )
 
         self._gather_logprobs_precompiled = True
+
+    def _precompile_apc_prompt_logprobs_suffix(self) -> None:
+        if not self.runner.vllm_config.cache_config.enable_prefix_caching_with_prompt_logprobs:
+            return
+        logger.info("Compiling APC prompt-logprobs suffix path.")
+        suffix_tokens = self.runner.block_size
+        hidden_size = self.runner.model_config.get_hidden_size()
+        vocab_size = self.runner.model_config.get_vocab_size()
+        hidden_states_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+        logits_sharding = NamedSharding(
+            self.runner.mesh,
+            PartitionSpec(ShardingAxisName.MLP_DATA,
+                          ShardingAxisName.MLP_TENSOR))
+        token_ids_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.MLP_DATA, ))
+        hidden_states = self._create_dummy_tensor(
+            (suffix_tokens, hidden_size), jnp.bfloat16, hidden_states_sharding)
+        with self.runner.maybe_select_dummy_loras(
+                self.runner.lora_config,
+                np.array([suffix_tokens], dtype=np.int32)):
+            lora_metadata = self.runner.lora_utils.extract_lora_metadata()
+            self._run_compilation(
+                f"worker{self.runner.rank} apc_prompt_logprobs_compute_logits",
+                self.runner.compute_logits_fn,
+                self.runner.state,
+                hidden_states,
+                lora_metadata,
+                num_reqs=suffix_tokens,
+            )
+
+        logits = self._create_dummy_tensor(
+            (suffix_tokens, vocab_size), jnp.float32, logits_sharding)
+        token_ids = self._create_dummy_tensor(
+            (suffix_tokens, ), jnp.int32, token_ids_sharding)
+        self._run_compilation(
+            f"worker{self.runner.rank} apc_prompt_logprobs_gather_logprobs",
+            self.runner._compute_and_gather_logprobs,
+            logits,
+            token_ids,
+            1,
+            num_reqs=suffix_tokens,
+        )
 
     def _precompile_speculative_decoding(self) -> None:
         logger.info(
