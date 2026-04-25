@@ -611,10 +611,8 @@ class CompilationManager:
         vocab_size = self.runner.model_config.get_vocab_size()
         hidden_states_sharding = NamedSharding(
             self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None))
-        logits_sharding = NamedSharding(
-            self.runner.mesh,
-            PartitionSpec(ShardingAxisName.MLP_DATA,
-                          ShardingAxisName.MLP_TENSOR))
+        indices_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None))
         token_ids_sharding = NamedSharding(
             self.runner.mesh, PartitionSpec(ShardingAxisName.MLP_DATA, ))
         for num_tokens in self.runner.num_tokens_paddings:
@@ -624,23 +622,33 @@ class CompilationManager:
                     self.runner.lora_config,
                     np.array([num_tokens], dtype=np.int32)):
                 lora_metadata = self.runner.lora_utils.extract_lora_metadata()
-                self._run_compilation(
-                    f"worker{self.runner.rank} apc_prompt_logprobs_compute_logits",
-                    self.runner.compute_logits_fn,
-                    self.runner.state,
-                    hidden_states,
-                    lora_metadata,
-                    num_reqs=num_tokens,
-                )
+                for num_reqs in self.runner.num_reqs_paddings:
+                    if num_reqs > num_tokens:
+                        continue
+                    logits_indices = self._create_dummy_tensor(
+                        (num_reqs, ), jnp.int32, indices_sharding)
+                    self._run_compilation(
+                        f"worker{self.runner.rank} apc_prompt_logprobs_sequence",
+                        self.runner._run_apc_prompt_logprobs_sequence,
+                        hidden_states,
+                        logits_indices,
+                        lora_metadata,
+                        num_tokens=num_tokens,
+                        num_reqs=num_reqs,
+                    )
 
-            logits = self._create_dummy_tensor(
-                (num_tokens, vocab_size), jnp.float32, logits_sharding)
             token_ids = self._create_dummy_tensor(
                 (num_tokens, ), jnp.int32, token_ids_sharding)
             self._run_compilation(
                 f"worker{self.runner.rank} apc_prompt_logprobs_gather_logprobs",
                 self.runner._compute_and_gather_logprobs,
-                logits,
+                self._create_dummy_tensor(
+                    (num_tokens, vocab_size),
+                    jnp.float32,
+                    NamedSharding(
+                        self.runner.mesh,
+                        PartitionSpec(ShardingAxisName.MLP_DATA,
+                                      ShardingAxisName.MLP_TENSOR))),
                 token_ids,
                 1,
                 num_reqs=num_tokens,

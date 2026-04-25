@@ -854,15 +854,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 for req_id in self.input_batch.req_ids[:self.input_batch
                                                        .num_reqs])
         if needs_prompt_logprobs:
-            full_query_logits = self.compute_logits_fn(
-                self.state,
-                hidden_states,
-                lora_metadata,
-            )
-            hidden_states = self._select_from_array_fn(hidden_states,
-                                                       logits_indices)
-            logits = self._select_from_array_fn(full_query_logits,
-                                                logits_indices)
+            (full_query_logits, hidden_states,
+             logits) = self._run_apc_prompt_logprobs_sequence(
+                 hidden_states,
+                 logits_indices,
+                 lora_metadata,
+             )
         else:
             hidden_states = self._select_from_array_fn(hidden_states,
                                                        logits_indices)
@@ -1109,6 +1106,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             kv_connector_output=kv_connector_output,
         )
         return model_runner_output
+
+    def _run_apc_prompt_logprobs_sequence(
+        self,
+        hidden_states: jax.Array,
+        logits_indices: jax.Array,
+        lora_metadata: Any,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        full_query_logits = self.compute_logits_fn(
+            self.state,
+            hidden_states,
+            lora_metadata,
+        )
+        selected_hidden_states = self._select_from_array_fn(
+            hidden_states, logits_indices)
+        selected_logits = self._select_from_array_fn(full_query_logits,
+                                                     logits_indices)
+        return full_query_logits, selected_hidden_states, selected_logits
 
     @functools.partial(jax.jit, static_argnums=(0, ))
     def _select_from_array_fn(self, array, indices_to_select):
