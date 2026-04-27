@@ -886,6 +886,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             0,
             shared_full_blocks,
         )
+        self.scoring_scratch_kv_caches = kv_caches
 
         max_req_blocks = max(req_block_counts)
         block_tables = np.zeros((len(suffix_token_ids), max_req_blocks), dtype=np.int32)
@@ -905,6 +906,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     req_private_block_start,
                     1,
                 )
+                self.scoring_scratch_kv_caches = kv_caches
             private_block_start += private_block_count
 
         flattened_input_ids: list[int] = []
