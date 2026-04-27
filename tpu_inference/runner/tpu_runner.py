@@ -172,7 +172,8 @@ class ExecuteModelState:
 @dataclass
 class PrefixScoringState:
     prompt_token_ids: list[int]
-    kv_caches: list[jax.Array]
+    context_kv_caches: list[jax.Array]
+    allocated_num_blocks: int
 
 
 @functools.partial(jax.jit, donate_argnums=(0, 1, 2))
@@ -349,6 +350,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.kv_caches: list[jax.Array] = []
         self.layer_name_to_kvcache_index: dict[str, int] = {}
         self.scoring_state: PrefixScoringState | None = None
+        self.scoring_scratch_kv_caches: list[jax.Array] = []
+        self.scoring_scratch_num_blocks = 0
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -606,6 +609,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def reset_scoring_state(self) -> None:
         self.scoring_state = None
+        self.scoring_scratch_kv_caches = []
+        self.scoring_scratch_num_blocks = 0
 
     def score_suffixes(
         self,
@@ -638,15 +643,55 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             return
         self._ensure_scoring_state(prompt_token_ids)
         assert self.scoring_state is not None
-        kv_caches = self._extend_scoring_prefix_kv_cache(
-            self.scoring_state.kv_caches,
-            len(self.scoring_state.prompt_token_ids),
-            suffix_token_ids,
-        )
+        old_prompt_token_ids = self.scoring_state.prompt_token_ids
+        context_len = len(old_prompt_token_ids) - 1
+        context_extension = [old_prompt_token_ids[-1], *suffix_token_ids[:-1]]
+        new_context_len = context_len + len(context_extension)
+        required_num_blocks = cdiv(new_context_len, self.block_size)
+        context_kv_caches, allocated_num_blocks = (
+            self._ensure_scoring_context_capacity(
+                self.scoring_state,
+                required_num_blocks,
+            ))
+        if context_extension:
+            input_ids = np.asarray(context_extension, dtype=np.int32)
+            positions = np.arange(context_len, new_context_len, dtype=np.int32)
+            query_start_loc = np.asarray([0, len(context_extension)],
+                                         dtype=np.int32)
+            seq_lens = np.asarray([new_context_len], dtype=np.int32)
+            block_tables = np.asarray([list(range(required_num_blocks))],
+                                      dtype=np.int32)
+            request_distribution = np.asarray([0, 0, 1], dtype=np.int32)
+            (input_ids_dev, positions_dev,
+             attention_metadata) = self._device_attention_metadata(
+                 input_ids,
+                 positions,
+                 query_start_loc,
+                 seq_lens,
+                 block_tables,
+                 request_distribution,
+             )
+            input_ids_dev, inputs_embeds = self._get_input_ids_embeds(
+                input_ids_dev, [])
+            lora_metadata = self.lora_utils.extract_lora_metadata()
+            with set_forward_context(None, self.vllm_config):
+                context_kv_caches, _, _ = self.model_fn(
+                    self.state,
+                    context_kv_caches,
+                    input_ids_dev,
+                    attention_metadata,
+                    inputs_embeds,
+                    positions_dev,
+                    tuple(self.layer_name_to_kvcache_index.items()),
+                    lora_metadata,
+                    None,
+                    self.is_first_rank,
+                    self.is_last_rank,
+                )
         self.scoring_state = PrefixScoringState(
-            prompt_token_ids=self.scoring_state.prompt_token_ids
-            + list(suffix_token_ids),
-            kv_caches=kv_caches,
+            prompt_token_ids=old_prompt_token_ids + list(suffix_token_ids),
+            context_kv_caches=context_kv_caches,
+            allocated_num_blocks=allocated_num_blocks,
         )
 
     def _ensure_scoring_state(self, prompt_token_ids: list[int]) -> None:
@@ -655,10 +700,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             and self.scoring_state.prompt_token_ids == prompt_token_ids
         ):
             return
-        self.scoring_state = PrefixScoringState(
-            prompt_token_ids=list(prompt_token_ids),
-            kv_caches=self._prefill_scoring_prefix(prompt_token_ids),
-        )
+        self.scoring_state = self._prefill_scoring_prefix(prompt_token_ids)
 
     def _scoring_kv_cache_specs(self):
         if not hasattr(self, "kv_cache_config"):
@@ -681,6 +723,38 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             cache_dtype=to_jax_dtype(representative_spec.dtype),
             use_mla=self.model_config.use_mla,
         )
+
+    def _ensure_scoring_context_capacity(
+        self,
+        scoring_state: PrefixScoringState,
+        required_num_blocks: int,
+    ) -> tuple[list[jax.Array], int]:
+        if required_num_blocks <= scoring_state.allocated_num_blocks:
+            return (scoring_state.context_kv_caches,
+                    scoring_state.allocated_num_blocks)
+        new_num_blocks = max(required_num_blocks,
+                             max(1, scoring_state.allocated_num_blocks * 2))
+        context_kv_caches = self._create_scoring_kv_caches(new_num_blocks)
+        used_num_blocks = cdiv(len(scoring_state.prompt_token_ids) - 1,
+                               self.block_size)
+        context_kv_caches = self._copy_scoring_prefix_blocks(
+            context_kv_caches,
+            scoring_state.context_kv_caches,
+            0,
+            0,
+            used_num_blocks,
+        )
+        return context_kv_caches, new_num_blocks
+
+    def _ensure_scoring_scratch_capacity(self, required_num_blocks: int) -> None:
+        if required_num_blocks <= self.scoring_scratch_num_blocks:
+            return
+        self.scoring_scratch_num_blocks = max(
+            required_num_blocks,
+            max(1, self.scoring_scratch_num_blocks * 2),
+        )
+        self.scoring_scratch_kv_caches = self._create_scoring_kv_caches(
+            self.scoring_scratch_num_blocks)
 
     def _device_attention_metadata(
         self,
@@ -713,42 +787,53 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         attention_metadata.seq_lens_cpu = seq_lens
         return input_ids_dev, positions_dev, attention_metadata
 
-    def _prefill_scoring_prefix(self, prompt_token_ids: list[int]) -> list[jax.Array]:
+    def _prefill_scoring_prefix(
+        self, prompt_token_ids: list[int]
+    ) -> PrefixScoringState:
         if not prompt_token_ids:
             raise ValueError("Prompt token ids must be non-empty")
-        num_blocks = cdiv(len(prompt_token_ids), self.block_size)
-        kv_caches = self._create_scoring_kv_caches(num_blocks)
-        input_ids = np.asarray(prompt_token_ids, dtype=np.int32)
-        positions = np.arange(len(prompt_token_ids), dtype=np.int32)
-        query_start_loc = np.asarray([0, len(prompt_token_ids)], dtype=np.int32)
-        seq_lens = np.asarray([len(prompt_token_ids)], dtype=np.int32)
-        block_tables = np.asarray([list(range(num_blocks))], dtype=np.int32)
-        request_distribution = np.asarray([0, 0, 1], dtype=np.int32)
-        input_ids_dev, positions_dev, attention_metadata = self._device_attention_metadata(
-            input_ids,
-            positions,
-            query_start_loc,
-            seq_lens,
-            block_tables,
-            request_distribution,
+        context_token_ids = prompt_token_ids[:-1]
+        context_len = len(context_token_ids)
+        num_blocks = cdiv(context_len, self.block_size)
+        context_kv_caches = self._create_scoring_kv_caches(num_blocks)
+        if context_token_ids:
+            input_ids = np.asarray(context_token_ids, dtype=np.int32)
+            positions = np.arange(context_len, dtype=np.int32)
+            query_start_loc = np.asarray([0, context_len], dtype=np.int32)
+            seq_lens = np.asarray([context_len], dtype=np.int32)
+            block_tables = np.asarray([list(range(num_blocks))], dtype=np.int32)
+            request_distribution = np.asarray([0, 0, 1], dtype=np.int32)
+            (input_ids_dev, positions_dev,
+             attention_metadata) = self._device_attention_metadata(
+                 input_ids,
+                 positions,
+                 query_start_loc,
+                 seq_lens,
+                 block_tables,
+                 request_distribution,
+             )
+            input_ids_dev, inputs_embeds = self._get_input_ids_embeds(
+                input_ids_dev, [])
+            lora_metadata = self.lora_utils.extract_lora_metadata()
+            with set_forward_context(None, self.vllm_config):
+                context_kv_caches, _, _ = self.model_fn(
+                    self.state,
+                    context_kv_caches,
+                    input_ids_dev,
+                    attention_metadata,
+                    inputs_embeds,
+                    positions_dev,
+                    tuple(self.layer_name_to_kvcache_index.items()),
+                    lora_metadata,
+                    None,
+                    self.is_first_rank,
+                    self.is_last_rank,
+                )
+        return PrefixScoringState(
+            prompt_token_ids=list(prompt_token_ids),
+            context_kv_caches=context_kv_caches,
+            allocated_num_blocks=num_blocks,
         )
-        input_ids_dev, inputs_embeds = self._get_input_ids_embeds(input_ids_dev, [])
-        lora_metadata = self.lora_utils.extract_lora_metadata()
-        with set_forward_context(None, self.vllm_config):
-            kv_caches, _, _ = self.model_fn(
-                self.state,
-                kv_caches,
-                input_ids_dev,
-                attention_metadata,
-                inputs_embeds,
-                positions_dev,
-                tuple(self.layer_name_to_kvcache_index.items()),
-                lora_metadata,
-                None,
-                self.is_first_rank,
-                self.is_last_rank,
-            )
-        return kv_caches
 
     def _copy_scoring_prefix_blocks(
         self,
@@ -772,55 +857,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             target_block,
         )
 
-    def _extend_scoring_prefix_kv_cache(
-        self,
-        prefix_kv_caches: list[jax.Array],
-        prefix_len: int,
-        suffix_token_ids: list[int],
-    ) -> list[jax.Array]:
-        total_len = prefix_len + len(suffix_token_ids)
-        old_num_blocks = cdiv(prefix_len, self.block_size)
-        new_num_blocks = cdiv(total_len, self.block_size)
-        kv_caches = self._create_scoring_kv_caches(new_num_blocks)
-        kv_caches = self._copy_scoring_prefix_blocks(
-            kv_caches,
-            prefix_kv_caches,
-            0,
-            0,
-            old_num_blocks,
-        )
-        input_ids = np.asarray(suffix_token_ids, dtype=np.int32)
-        positions = np.arange(prefix_len, total_len, dtype=np.int32)
-        query_start_loc = np.asarray([0, len(suffix_token_ids)], dtype=np.int32)
-        seq_lens = np.asarray([total_len], dtype=np.int32)
-        block_tables = np.asarray([list(range(new_num_blocks))], dtype=np.int32)
-        request_distribution = np.asarray([0, 0, 1], dtype=np.int32)
-        input_ids_dev, positions_dev, attention_metadata = self._device_attention_metadata(
-            input_ids,
-            positions,
-            query_start_loc,
-            seq_lens,
-            block_tables,
-            request_distribution,
-        )
-        input_ids_dev, inputs_embeds = self._get_input_ids_embeds(input_ids_dev, [])
-        lora_metadata = self.lora_utils.extract_lora_metadata()
-        with set_forward_context(None, self.vllm_config):
-            kv_caches, _, _ = self.model_fn(
-                self.state,
-                kv_caches,
-                input_ids_dev,
-                attention_metadata,
-                inputs_embeds,
-                positions_dev,
-                tuple(self.layer_name_to_kvcache_index.items()),
-                lora_metadata,
-                None,
-                self.is_first_rank,
-                self.is_last_rank,
-            )
-        return kv_caches
-
     def _score_suffixes_from_state(
         self,
         scoring_state: PrefixScoringState,
@@ -841,10 +877,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             req_block_count - shared_full_blocks for req_block_count in req_block_counts
         ]
         total_blocks = shared_full_blocks + sum(private_blocks_per_req)
-        kv_caches = self._create_scoring_kv_caches(total_blocks)
+        self._ensure_scoring_scratch_capacity(total_blocks)
+        kv_caches = self.scoring_scratch_kv_caches
         kv_caches = self._copy_scoring_prefix_blocks(
             kv_caches,
-            scoring_state.kv_caches,
+            scoring_state.context_kv_caches,
             0,
             0,
             shared_full_blocks,
@@ -863,7 +900,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             if has_private_prefix_tail:
                 kv_caches = self._copy_scoring_prefix_blocks(
                     kv_caches,
-                    scoring_state.kv_caches,
+                    scoring_state.context_kv_caches,
                     private_prefix_source_block,
                     req_private_block_start,
                     1,
