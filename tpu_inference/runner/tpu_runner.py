@@ -942,7 +942,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         input_ids_dev, inputs_embeds = self._get_input_ids_embeds(input_ids_dev, [])
         lora_metadata = self.lora_utils.extract_lora_metadata()
         with set_forward_context(None, self.vllm_config):
-            _, hidden_states, _ = self.model_fn(
+            kv_caches, hidden_states, _ = self.model_fn(
                 self.state,
                 kv_caches,
                 input_ids_dev,
@@ -955,6 +955,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 self.is_first_rank,
                 self.is_last_rank,
             )
+        self.scoring_scratch_kv_caches = kv_caches
         score_indices_dev = device_array(
             self.mesh, np.asarray(score_indices, dtype=np.int32)
         )
