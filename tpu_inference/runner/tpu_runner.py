@@ -55,8 +55,9 @@ from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
                                                   ShardingAxisName,
                                                   ShardingConfigManager)
 from tpu_inference.layers.jax.sample.rejection_sampler import RejectionSampler
-from tpu_inference.layers.jax.sample.sampling import (compute_logprobs,
-                                                      gather_logprobs, sample)
+from tpu_inference.layers.jax.sample.sampling import (
+    compute_logprobs, gather_logprobs, gather_token_logprobs_from_logits,
+    sample)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 from tpu_inference.logger import init_logger
@@ -68,6 +69,7 @@ from tpu_inference.models.jax.utils.weight_utils import (
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.compilation_manager import CompilationManager
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
+from tpu_inference.runner.kv_cache import create_kv_caches
 from tpu_inference.runner.kv_cache_manager import KVCacheManager
 from tpu_inference.runner.lora_utils import LoraUtils
 from tpu_inference.runner.multimodal_manager import MultiModalManager
@@ -160,6 +162,13 @@ class ExecuteModelState:
     kv_connector_output: Optional[KVConnectorOutput]
     logits_indices_selector: Optional[List[int]] = None
     padded_num_reqs: Optional[int] = None
+
+
+@dataclass
+class PrefixScoringState:
+    prompt_token_ids: list[int]
+    context_kv_caches: list[jax.Array]
+    allocated_num_blocks: int
 
 
 @functools.partial(jax.jit, donate_argnums=(0, 1, 2))
@@ -284,6 +293,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self.kv_caches: list[jax.Array] = []
         self.layer_name_to_kvcache_index: dict[str, int] = {}
+        self.scoring_state: PrefixScoringState | None = None
+        self.scoring_scratch_kv_caches: list[jax.Array] = []
+        self.scoring_scratch_num_blocks = 0
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -538,6 +550,382 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return ("generate", )
+
+    def reset_scoring_state(self) -> None:
+        self.scoring_state = None
+        self.scoring_scratch_kv_caches = []
+        self.scoring_scratch_num_blocks = 0
+
+    def score_suffixes(
+        self,
+        prompt_token_ids: list[int],
+        suffix_token_ids: list[list[int]],
+    ) -> list[float]:
+        if self.dp_size > 1:
+            raise NotImplementedError("score_suffixes does not support DP")
+        if self.use_hybrid_kvcache:
+            raise NotImplementedError(
+                "score_suffixes does not support hybrid KV cache"
+            )
+        if self.is_multimodal_model:
+            raise NotImplementedError("score_suffixes only supports text models")
+        if not suffix_token_ids:
+            return []
+        if any(len(tokens) == 0 for tokens in suffix_token_ids):
+            raise ValueError("score_suffixes requires non-empty suffixes")
+
+        self._ensure_scoring_state(prompt_token_ids)
+        assert self.scoring_state is not None
+        return self._score_suffixes_from_state(self.scoring_state, suffix_token_ids)
+
+    def accept_scoring_suffix(
+        self,
+        prompt_token_ids: list[int],
+        suffix_token_ids: list[int],
+    ) -> None:
+        if not suffix_token_ids:
+            return
+        self._ensure_scoring_state(prompt_token_ids)
+        assert self.scoring_state is not None
+        old_prompt_token_ids = self.scoring_state.prompt_token_ids
+        context_len = len(old_prompt_token_ids) - 1
+        context_extension = [old_prompt_token_ids[-1], *suffix_token_ids[:-1]]
+        new_context_len = context_len + len(context_extension)
+        required_num_blocks = cdiv(new_context_len, self.block_size)
+        context_kv_caches, allocated_num_blocks = (
+            self._ensure_scoring_context_capacity(
+                self.scoring_state,
+                required_num_blocks,
+            ))
+        if context_extension:
+            input_ids = np.asarray(context_extension, dtype=np.int32)
+            positions = np.arange(context_len, new_context_len, dtype=np.int32)
+            query_start_loc = np.asarray([0, len(context_extension)],
+                                         dtype=np.int32)
+            seq_lens = np.asarray([new_context_len], dtype=np.int32)
+            block_tables = np.asarray([list(range(required_num_blocks))],
+                                      dtype=np.int32)
+            request_distribution = np.asarray([0, 0, 1], dtype=np.int32)
+            (input_ids_dev, positions_dev,
+             attention_metadata) = self._device_attention_metadata(
+                 input_ids,
+                 positions,
+                 query_start_loc,
+                 seq_lens,
+                 block_tables,
+                 request_distribution,
+             )
+            input_ids_dev, inputs_embeds = self._get_input_ids_embeds(
+                input_ids_dev, [])
+            lora_metadata = self.lora_utils.extract_lora_metadata()
+            with set_forward_context(None, self.vllm_config):
+                context_kv_caches, _, _ = self.model_fn(
+                    self.state,
+                    context_kv_caches,
+                    input_ids_dev,
+                    attention_metadata,
+                    inputs_embeds,
+                    positions_dev,
+                    tuple(self.layer_name_to_kvcache_index.items()),
+                    lora_metadata,
+                    None,
+                    self.is_first_rank,
+                    self.is_last_rank,
+                )
+        self.scoring_state = PrefixScoringState(
+            prompt_token_ids=old_prompt_token_ids + list(suffix_token_ids),
+            context_kv_caches=context_kv_caches,
+            allocated_num_blocks=allocated_num_blocks,
+        )
+
+    def _ensure_scoring_state(self, prompt_token_ids: list[int]) -> None:
+        if (
+            self.scoring_state is not None
+            and self.scoring_state.prompt_token_ids == prompt_token_ids
+        ):
+            return
+        self.scoring_state = self._prefill_scoring_prefix(prompt_token_ids)
+
+    def _scoring_kv_cache_specs(self):
+        if not hasattr(self, "kv_cache_config"):
+            raise RuntimeError("KV cache must be initialized before scoring")
+        if len(self.kv_cache_config.kv_cache_groups) != 1:
+            raise NotImplementedError(
+                "score_suffixes only supports a single KV cache group"
+            )
+        return self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+
+    def _create_scoring_kv_caches(self, num_blocks: int) -> list[jax.Array]:
+        representative_spec = self._scoring_kv_cache_specs()
+        return create_kv_caches(
+            num_blocks=num_blocks,
+            block_size=representative_spec.block_size,
+            num_kv_heads=representative_spec.num_kv_heads,
+            head_size=representative_spec.head_size,
+            mesh=self.mesh,
+            layer_names=[f"score_layer.{i}" for i in range(len(self.kv_caches))],
+            cache_dtype=to_jax_dtype(representative_spec.dtype),
+            use_mla=self.model_config.use_mla,
+        )
+
+    def _ensure_scoring_context_capacity(
+        self,
+        scoring_state: PrefixScoringState,
+        required_num_blocks: int,
+    ) -> tuple[list[jax.Array], int]:
+        if required_num_blocks <= scoring_state.allocated_num_blocks:
+            return (scoring_state.context_kv_caches,
+                    scoring_state.allocated_num_blocks)
+        new_num_blocks = max(required_num_blocks,
+                             max(1, scoring_state.allocated_num_blocks * 2))
+        context_kv_caches = self._create_scoring_kv_caches(new_num_blocks)
+        used_num_blocks = cdiv(len(scoring_state.prompt_token_ids) - 1,
+                               self.block_size)
+        context_kv_caches = self._copy_scoring_prefix_blocks(
+            context_kv_caches,
+            scoring_state.context_kv_caches,
+            0,
+            0,
+            used_num_blocks,
+        )
+        return context_kv_caches, new_num_blocks
+
+    def _ensure_scoring_scratch_capacity(self, required_num_blocks: int) -> None:
+        if required_num_blocks <= self.scoring_scratch_num_blocks:
+            return
+        self.scoring_scratch_num_blocks = max(
+            required_num_blocks,
+            max(1, self.scoring_scratch_num_blocks * 2),
+        )
+        self.scoring_scratch_kv_caches = self._create_scoring_kv_caches(
+            self.scoring_scratch_num_blocks)
+
+    def _device_attention_metadata(
+        self,
+        input_ids: np.ndarray,
+        positions: np.ndarray,
+        query_start_loc: np.ndarray,
+        seq_lens: np.ndarray,
+        block_tables: np.ndarray,
+        request_distribution: np.ndarray,
+    ) -> tuple[jax.Array, jax.Array, AttentionMetadata]:
+        (
+            input_ids_dev,
+            positions_dev,
+            query_start_loc_dev,
+            seq_lens_dev,
+            request_distribution_dev,
+        ) = device_array(
+            self.mesh,
+            (input_ids, positions, query_start_loc, seq_lens, request_distribution),
+        )
+        block_tables_dev = device_array(self.mesh, block_tables.reshape(-1))
+        attention_metadata = AttentionMetadata(
+            input_positions=positions_dev,
+            block_tables=block_tables_dev,
+            seq_lens=seq_lens_dev,
+            query_start_loc=query_start_loc_dev,
+            request_distribution=request_distribution_dev,
+        )
+        attention_metadata.query_start_loc_cpu = query_start_loc
+        attention_metadata.seq_lens_cpu = seq_lens
+        return input_ids_dev, positions_dev, attention_metadata
+
+    def _prefill_scoring_prefix(
+        self, prompt_token_ids: list[int]
+    ) -> PrefixScoringState:
+        if not prompt_token_ids:
+            raise ValueError("Prompt token ids must be non-empty")
+        context_token_ids = prompt_token_ids[:-1]
+        context_len = len(context_token_ids)
+        num_blocks = cdiv(context_len, self.block_size)
+        context_kv_caches = self._create_scoring_kv_caches(num_blocks)
+        if context_token_ids:
+            input_ids = np.asarray(context_token_ids, dtype=np.int32)
+            positions = np.arange(context_len, dtype=np.int32)
+            query_start_loc = np.asarray([0, context_len], dtype=np.int32)
+            seq_lens = np.asarray([context_len], dtype=np.int32)
+            block_tables = np.asarray([list(range(num_blocks))], dtype=np.int32)
+            request_distribution = np.asarray([0, 0, 1], dtype=np.int32)
+            (input_ids_dev, positions_dev,
+             attention_metadata) = self._device_attention_metadata(
+                 input_ids,
+                 positions,
+                 query_start_loc,
+                 seq_lens,
+                 block_tables,
+                 request_distribution,
+             )
+            input_ids_dev, inputs_embeds = self._get_input_ids_embeds(
+                input_ids_dev, [])
+            lora_metadata = self.lora_utils.extract_lora_metadata()
+            with set_forward_context(None, self.vllm_config):
+                context_kv_caches, _, _ = self.model_fn(
+                    self.state,
+                    context_kv_caches,
+                    input_ids_dev,
+                    attention_metadata,
+                    inputs_embeds,
+                    positions_dev,
+                    tuple(self.layer_name_to_kvcache_index.items()),
+                    lora_metadata,
+                    None,
+                    self.is_first_rank,
+                    self.is_last_rank,
+                )
+        return PrefixScoringState(
+            prompt_token_ids=list(prompt_token_ids),
+            context_kv_caches=context_kv_caches,
+            allocated_num_blocks=num_blocks,
+        )
+
+    def _copy_scoring_prefix_blocks(
+        self,
+        target_kv_caches: list[jax.Array],
+        source_kv_caches: list[jax.Array],
+        source_block: int,
+        target_block: int,
+        num_blocks: int,
+    ) -> list[jax.Array]:
+        if num_blocks == 0:
+            return target_kv_caches
+        kv_cache_slices = KVCacheManager._jitted_gather_continuous_kv_cache(
+            source_kv_caches,
+            source_block,
+            num_blocks,
+        )
+        return KVCacheManager._jitted_insert_continuous_kv_cache(
+            self.block_size,
+            target_kv_caches,
+            kv_cache_slices,
+            target_block,
+        )
+
+    def _score_suffixes_from_state(
+        self,
+        scoring_state: PrefixScoringState,
+        suffix_token_ids: list[list[int]],
+    ) -> list[float]:
+        prompt_token_ids = scoring_state.prompt_token_ids
+        prefix_len = len(prompt_token_ids)
+        base_len = prefix_len - 1
+        shared_full_blocks = base_len // self.block_size
+        has_private_prefix_tail = (base_len % self.block_size) != 0
+        private_prefix_source_block = shared_full_blocks
+        last_prefix_token = prompt_token_ids[-1]
+        query_lengths = [1 + len(tokens) for tokens in suffix_token_ids]
+        req_block_counts = [
+            cdiv(base_len + query_len, self.block_size) for query_len in query_lengths
+        ]
+        private_blocks_per_req = [
+            req_block_count - shared_full_blocks for req_block_count in req_block_counts
+        ]
+        total_blocks = shared_full_blocks + sum(private_blocks_per_req)
+        self._ensure_scoring_scratch_capacity(total_blocks)
+        kv_caches = self.scoring_scratch_kv_caches
+        kv_caches = self._copy_scoring_prefix_blocks(
+            kv_caches,
+            scoring_state.context_kv_caches,
+            0,
+            0,
+            shared_full_blocks,
+        )
+        self.scoring_scratch_kv_caches = kv_caches
+
+        max_req_blocks = max(req_block_counts)
+        block_tables = np.zeros((len(suffix_token_ids), max_req_blocks), dtype=np.int32)
+        private_block_start = shared_full_blocks
+        for req_idx, private_block_count in enumerate(private_blocks_per_req):
+            req_block_ids = list(range(shared_full_blocks))
+            req_private_block_start = private_block_start
+            req_block_ids.extend(
+                range(req_private_block_start, req_private_block_start + private_block_count)
+            )
+            block_tables[req_idx, :len(req_block_ids)] = req_block_ids
+            if has_private_prefix_tail:
+                kv_caches = self._copy_scoring_prefix_blocks(
+                    kv_caches,
+                    scoring_state.context_kv_caches,
+                    private_prefix_source_block,
+                    req_private_block_start,
+                    1,
+                )
+                self.scoring_scratch_kv_caches = kv_caches
+            private_block_start += private_block_count
+
+        flattened_input_ids: list[int] = []
+        flattened_positions: list[int] = []
+        query_start_loc = [0]
+        seq_lens = []
+        score_indices: list[int] = []
+        target_token_ids: list[int] = []
+        token_offset = 0
+        for tokens in suffix_token_ids:
+            query_tokens = [last_prefix_token] + tokens
+            flattened_input_ids.extend(query_tokens)
+            flattened_positions.extend(range(base_len, base_len + len(query_tokens)))
+            query_start_loc.append(query_start_loc[-1] + len(query_tokens))
+            seq_lens.append(base_len + len(query_tokens))
+            score_indices.extend(range(token_offset, token_offset + len(tokens)))
+            target_token_ids.extend(tokens)
+            token_offset += len(query_tokens)
+
+        input_ids = np.asarray(flattened_input_ids, dtype=np.int32)
+        positions = np.asarray(flattened_positions, dtype=np.int32)
+        query_start_loc_np = np.asarray(query_start_loc, dtype=np.int32)
+        seq_lens_np = np.asarray(seq_lens, dtype=np.int32)
+        request_distribution = np.asarray([0, 0, len(suffix_token_ids)], dtype=np.int32)
+        input_ids_dev, positions_dev, attention_metadata = self._device_attention_metadata(
+            input_ids,
+            positions,
+            query_start_loc_np,
+            seq_lens_np,
+            block_tables,
+            request_distribution,
+        )
+        input_ids_dev, inputs_embeds = self._get_input_ids_embeds(input_ids_dev, [])
+        lora_metadata = self.lora_utils.extract_lora_metadata()
+        with set_forward_context(None, self.vllm_config):
+            kv_caches, hidden_states, _ = self.model_fn(
+                self.state,
+                kv_caches,
+                input_ids_dev,
+                attention_metadata,
+                inputs_embeds,
+                positions_dev,
+                tuple(self.layer_name_to_kvcache_index.items()),
+                lora_metadata,
+                None,
+                self.is_first_rank,
+                self.is_last_rank,
+            )
+        self.scoring_scratch_kv_caches = kv_caches
+        score_indices_dev = device_array(
+            self.mesh, np.asarray(score_indices, dtype=np.int32)
+        )
+        target_token_ids_dev = device_array(
+            self.mesh, np.asarray(target_token_ids, dtype=np.int32)
+        )
+        suffix_hidden_states = self._select_from_array_fn(
+            hidden_states, score_indices_dev
+        )
+        suffix_logits = self.compute_logits_fn(
+            self.state,
+            suffix_hidden_states,
+            lora_metadata,
+        )
+        suffix_logprobs = gather_token_logprobs_from_logits(
+            suffix_logits,
+            target_token_ids_dev,
+        )
+        token_scores = np.asarray(jax.device_get(suffix_logprobs))
+        scores = []
+        offset = 0
+        for tokens in suffix_token_ids:
+            next_offset = offset + len(tokens)
+            scores.append(float(token_scores[offset:next_offset].sum()))
+            offset = next_offset
+        return scores
 
     def get_kv_cache_spec(self):
         return self.kv_cache_manager.get_kv_cache_spec()

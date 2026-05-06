@@ -380,6 +380,23 @@ class TPUWorker:
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
 
+    def reset_scoring_state(self) -> None:
+        self.model_runner.reset_scoring_state()
+
+    def score_suffixes(
+        self,
+        prompt_token_ids: list[int],
+        suffix_token_ids: list[list[int]],
+    ) -> list[float]:
+        return self.model_runner.score_suffixes(prompt_token_ids, suffix_token_ids)
+
+    def accept_scoring_suffix(
+        self,
+        prompt_token_ids: list[int],
+        suffix_token_ids: list[int],
+    ) -> None:
+        self.model_runner.accept_scoring_suffix(prompt_token_ids, suffix_token_ids)
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         # NOTE: This method intentionally returns a concrete vLLM type, which
         # violates the pure abstract contract of the base class. This is a

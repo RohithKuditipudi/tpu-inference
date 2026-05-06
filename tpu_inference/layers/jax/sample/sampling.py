@@ -67,6 +67,16 @@ def compute_logprobs(logits: jax.Array) -> jax.Array:
     return jax.nn.log_softmax(logits, axis=-1)
 
 
+def gather_token_logprobs_from_logits(logits: jax.Array,
+                                      token_ids: jax.Array) -> jax.Array:
+    token_ids = jnp.expand_dims(token_ids, axis=-1)
+    token_logits = jnp.take_along_axis(logits, token_ids, axis=-1)
+    normalizers = jax.scipy.special.logsumexp(logits,
+                                              axis=-1,
+                                              keepdims=True)
+    return jnp.squeeze(token_logits - normalizers, axis=-1)
+
+
 def gather_logprobs(
     logprobs: jax.Array,
     token_ids: jax.Array,
