@@ -206,6 +206,48 @@ def _substitute_placeholder_token(
     return input_ids.at[token_in_tpu_cur_input_indices].set(update_values)
 
 
+@functools.partial(
+    jax.jit,
+    static_argnames=("mesh", "num_blocks"),
+    donate_argnames=("target_kv_caches", ),
+)
+def _scorer_shard_local_copy_kv_blocks(
+    mesh: jax.sharding.Mesh,
+    target_kv_caches: List[jax.Array],
+    source_kv_caches: List[jax.Array],
+    source_block,
+    target_block,
+    num_blocks: int,
+) -> List[jax.Array]:
+    """Copy num_blocks contiguous KV blocks within each ATTN_DATA shard.
+
+    source_block and target_block are interpreted as block IDs local to each
+    shard's slice, so the copy stays per-rank and never crosses ranks. At
+    dp_size=1 the ATTN_DATA axis has one device and the shard_map degenerates
+    to the single-shard slice/update.
+    """
+    spec = PartitionSpec(ShardingAxisName.ATTN_DATA, None,
+                         ShardingAxisName.ATTN_HEAD)
+
+    def _copy_layer(target_cache, source_cache):
+        return jax.shard_map(
+            lambda t, s: jax.lax.dynamic_update_slice_in_dim(
+                t,
+                jax.lax.dynamic_slice_in_dim(s,
+                                             source_block,
+                                             num_blocks,
+                                             axis=0),
+                target_block,
+                axis=0,
+            ),
+            mesh=mesh,
+            in_specs=(spec, spec),
+            out_specs=spec,
+        )(target_cache, source_cache)
+
+    return jax.tree.map(_copy_layer, target_kv_caches, source_kv_caches)
+
+
 def _jax_logprobs_to_lists(logprobs_tensors,
                            logits_indices_selector=None,
                            cu_num_generated_tokens=None):
@@ -561,14 +603,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         prompt_token_ids: list[int],
         suffix_token_ids: list[list[int]],
     ) -> list[float]:
-        if self.dp_size > 1:
-            raise NotImplementedError("score_suffixes does not support DP")
         if self.use_hybrid_kvcache:
             raise NotImplementedError(
                 "score_suffixes does not support hybrid KV cache"
             )
         if self.is_multimodal_model:
             raise NotImplementedError("score_suffixes only supports text models")
+        if self.dp_size > 1 and self.model_config.use_mla:
+            raise NotImplementedError(
+                "score_suffixes does not support DP with MLA models")
         if not suffix_token_ids:
             return []
         if any(len(tokens) == 0 for tokens in suffix_token_ids):
@@ -585,35 +628,40 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     ) -> None:
         if not suffix_token_ids:
             return
+        if self.dp_size > 1 and self.model_config.use_mla:
+            raise NotImplementedError(
+                "accept_scoring_suffix does not support DP with MLA models")
         self._ensure_scoring_state(prompt_token_ids)
         assert self.scoring_state is not None
         old_prompt_token_ids = self.scoring_state.prompt_token_ids
         context_len = len(old_prompt_token_ids) - 1
         context_extension = [old_prompt_token_ids[-1], *suffix_token_ids[:-1]]
         new_context_len = context_len + len(context_extension)
-        required_num_blocks = cdiv(new_context_len, self.block_size)
-        context_kv_caches, allocated_num_blocks = (
+        required_local_num_blocks = cdiv(new_context_len, self.block_size)
+        context_kv_caches, allocated_local_num_blocks = (
             self._ensure_scoring_context_capacity(
                 self.scoring_state,
-                required_num_blocks,
+                required_local_num_blocks,
             ))
         if context_extension:
-            input_ids = np.asarray(context_extension, dtype=np.int32)
-            positions = np.arange(context_len, new_context_len, dtype=np.int32)
-            query_start_loc = np.asarray([0, len(context_extension)],
-                                         dtype=np.int32)
-            seq_lens = np.asarray([new_context_len], dtype=np.int32)
-            block_tables = np.asarray([list(range(required_num_blocks))],
-                                      dtype=np.int32)
-            request_distribution = np.asarray([0, 0, 1], dtype=np.int32)
+            block_table_row = list(range(required_local_num_blocks))
+            # Same extension row replicated to every rank so each shard extends
+            # its own local copy of the prefix.
+            rank_inputs = [{
+                "queries": [list(context_extension)],
+                "query_start_positions": [context_len],
+                "block_table_rows": [block_table_row],
+                "num_decode": 0,
+            } for _ in range(self.dp_size)]
+            packed = self._pack_scorer_dp_inputs(rank_inputs)
             (input_ids_dev, positions_dev,
-             attention_metadata) = self._device_attention_metadata(
-                 input_ids,
-                 positions,
-                 query_start_loc,
-                 seq_lens,
-                 block_tables,
-                 request_distribution,
+             attention_metadata) = self._scorer_dp_device_attention_metadata(
+                 packed["input_ids"],
+                 packed["positions"],
+                 packed["query_start_loc"],
+                 packed["seq_lens"],
+                 packed["block_tables"],
+                 packed["request_distribution"],
              )
             input_ids_dev, inputs_embeds = self._get_input_ids_embeds(
                 input_ids_dev, [])
@@ -635,7 +683,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.scoring_state = PrefixScoringState(
             prompt_token_ids=old_prompt_token_ids + list(suffix_token_ids),
             context_kv_caches=context_kv_caches,
-            allocated_num_blocks=allocated_num_blocks,
+            allocated_num_blocks=allocated_local_num_blocks,
         )
 
     def _ensure_scoring_state(self, prompt_token_ids: list[int]) -> None:
@@ -655,10 +703,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             )
         return self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
 
-    def _create_scoring_kv_caches(self, num_blocks: int) -> list[jax.Array]:
+    def _create_scoring_kv_caches(
+            self, local_num_blocks: int) -> list[jax.Array]:
+        """Allocate scorer KV caches sized for `local_num_blocks` per shard.
+
+        Internally allocates `local_num_blocks * self.dp_size` global blocks
+        so that, after ATTN_DATA sharding on the leading axis, each shard
+        owns `local_num_blocks` blocks indexed by local IDs `[0, local_num_blocks)`.
+        """
         representative_spec = self._scoring_kv_cache_specs()
+        global_num_blocks = local_num_blocks * self.dp_size
         return create_kv_caches(
-            num_blocks=num_blocks,
+            num_blocks=global_num_blocks,
             block_size=representative_spec.block_size,
             num_kv_heads=representative_spec.num_kv_heads,
             head_size=representative_spec.head_size,
@@ -671,30 +727,38 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     def _ensure_scoring_context_capacity(
         self,
         scoring_state: PrefixScoringState,
-        required_num_blocks: int,
+        required_local_num_blocks: int,
     ) -> tuple[list[jax.Array], int]:
-        if required_num_blocks <= scoring_state.allocated_num_blocks:
+        """Grow the persistent context cache so each shard holds at least
+        `required_local_num_blocks` local blocks. Sizes are local-per-shard.
+        """
+        if required_local_num_blocks <= scoring_state.allocated_num_blocks:
             return (scoring_state.context_kv_caches,
                     scoring_state.allocated_num_blocks)
-        new_num_blocks = max(required_num_blocks,
-                             max(1, scoring_state.allocated_num_blocks * 2))
-        context_kv_caches = self._create_scoring_kv_caches(new_num_blocks)
-        used_num_blocks = cdiv(len(scoring_state.prompt_token_ids) - 1,
-                               self.block_size)
+        new_local_num_blocks = max(
+            required_local_num_blocks,
+            max(1, scoring_state.allocated_num_blocks * 2))
+        context_kv_caches = self._create_scoring_kv_caches(new_local_num_blocks)
+        used_local_num_blocks = cdiv(
+            len(scoring_state.prompt_token_ids) - 1, self.block_size)
         context_kv_caches = self._copy_scoring_prefix_blocks(
             context_kv_caches,
             scoring_state.context_kv_caches,
             0,
             0,
-            used_num_blocks,
+            used_local_num_blocks,
         )
-        return context_kv_caches, new_num_blocks
+        return context_kv_caches, new_local_num_blocks
 
-    def _ensure_scoring_scratch_capacity(self, required_num_blocks: int) -> None:
-        if required_num_blocks <= self.scoring_scratch_num_blocks:
+    def _ensure_scoring_scratch_capacity(
+            self, required_local_num_blocks: int) -> None:
+        """Grow the scratch cache so each shard holds at least
+        `required_local_num_blocks` local blocks.
+        """
+        if required_local_num_blocks <= self.scoring_scratch_num_blocks:
             return
         self.scoring_scratch_num_blocks = max(
-            required_num_blocks,
+            required_local_num_blocks,
             max(1, self.scoring_scratch_num_blocks * 2),
         )
         self.scoring_scratch_kv_caches = self._create_scoring_kv_caches(
@@ -731,6 +795,152 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         attention_metadata.seq_lens_cpu = seq_lens
         return input_ids_dev, positions_dev, attention_metadata
 
+    def _scorer_dp_device_attention_metadata(
+        self,
+        input_ids: np.ndarray,
+        positions: np.ndarray,
+        query_start_loc: np.ndarray,
+        seq_lens: np.ndarray,
+        block_tables: np.ndarray,
+        request_distribution: np.ndarray,
+    ) -> tuple[jax.Array, jax.Array, AttentionMetadata]:
+        """Place pre-packed scorer arrays on device with ATTN_DATA sharding.
+
+        Inputs are expected to already be packed into per-rank padded segments
+        (see `_pack_scorer_dp_inputs`); this just attaches the right sharding
+        for the leading axis.
+        """
+        attn_data_sharding = NamedSharding(
+            self.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+        (
+            input_ids_dev,
+            positions_dev,
+            query_start_loc_dev,
+            seq_lens_dev,
+            request_distribution_dev,
+        ) = device_array(
+            self.mesh,
+            (input_ids, positions, query_start_loc, seq_lens,
+             request_distribution),
+            sharding=attn_data_sharding,
+        )
+        block_tables_dev = device_array(self.mesh,
+                                        block_tables.reshape(-1),
+                                        sharding=attn_data_sharding)
+        attention_metadata = AttentionMetadata(
+            input_positions=positions_dev,
+            block_tables=block_tables_dev,
+            seq_lens=seq_lens_dev,
+            query_start_loc=query_start_loc_dev,
+            request_distribution=request_distribution_dev,
+        )
+        attention_metadata.query_start_loc_cpu = query_start_loc
+        attention_metadata.seq_lens_cpu = seq_lens
+        return input_ids_dev, positions_dev, attention_metadata
+
+    def _pack_scorer_dp_inputs(
+        self,
+        rank_inputs: list[dict],
+    ) -> dict:
+        """Pack per-rank scorer inputs into ATTN_DATA-shardable CPU arrays.
+
+        Each entry in `rank_inputs` describes one DP rank's segment:
+          - `queries`: list[list[int]] -- token IDs of each query on the rank
+          - `query_start_positions`: list[int] -- the starting position id (in
+            the cached sequence) for each query on the rank
+          - `block_table_rows`: list[list[int]] -- local block IDs per query
+          - `num_decode`: int -- count of decode queries (for request_distribution)
+
+        Returns a dict of packed numpy arrays plus the per-rank padded sizes:
+        `padded_tokens_per_rank`, `padded_reqs_per_rank`, `max_blocks_per_req`.
+        Padded entries follow the conventions used by `_prepare_inputs_dp`.
+        """
+        dp_size = self.dp_size
+        assert len(rank_inputs) == dp_size
+
+        max_tokens_per_rank = max(
+            (sum(len(q) for q in r["queries"]) for r in rank_inputs),
+            default=0)
+        max_reqs_per_rank = max(
+            (len(r["queries"]) for r in rank_inputs), default=0)
+        max_blocks_per_req = max(
+            (max((len(b) for b in r["block_table_rows"]), default=0)
+             for r in rank_inputs),
+            default=0)
+
+        padded_tokens_per_rank = runner_utils.get_padded_token_len(
+            self.num_tokens_paddings_per_dp, max(1, max_tokens_per_rank))
+        padded_reqs_per_rank = runner_utils.get_padded_token_len(
+            self.num_reqs_paddings_per_dp, max(1, max_reqs_per_rank))
+        max_blocks_per_req = max(1, max_blocks_per_req)
+
+        total_tokens = padded_tokens_per_rank * dp_size
+        total_reqs = padded_reqs_per_rank * dp_size
+        total_qsl = (padded_reqs_per_rank + 1) * dp_size
+
+        input_ids = np.zeros(total_tokens, dtype=np.int32)
+        positions = np.zeros(total_tokens, dtype=np.int32)
+        query_start_loc = np.zeros(total_qsl, dtype=np.int32)
+        seq_lens = np.zeros(total_reqs, dtype=np.int32)
+        block_tables = np.zeros((total_reqs, max_blocks_per_req),
+                                dtype=np.int32)
+        request_distribution = np.zeros(3 * dp_size, dtype=np.int32)
+
+        for rank, ri in enumerate(rank_inputs):
+            queries = ri["queries"]
+            qstarts = ri["query_start_positions"]
+            btrs = ri["block_table_rows"]
+            num_reqs_in_rank = len(queries)
+            assert len(qstarts) == num_reqs_in_rank
+            assert len(btrs) == num_reqs_in_rank
+
+            token_offset = rank * padded_tokens_per_rank
+            req_offset = rank * padded_reqs_per_rank
+            qsl_offset = rank * (padded_reqs_per_rank + 1)
+
+            flat = 0
+            for q_idx, query in enumerate(queries):
+                start_pos = qstarts[q_idx]
+                qlen = len(query)
+                input_ids[token_offset + flat:token_offset + flat +
+                          qlen] = np.asarray(query, dtype=np.int32)
+                positions[token_offset + flat:token_offset + flat +
+                          qlen] = np.arange(start_pos,
+                                            start_pos + qlen,
+                                            dtype=np.int32)
+                seq_lens[req_offset + q_idx] = start_pos + qlen
+                row = np.asarray(btrs[q_idx], dtype=np.int32)
+                block_tables[req_offset + q_idx, :len(row)] = row
+                flat += qlen
+
+            # Match _prepare_inputs_dp: empty ranks get all-zero
+            # query_start_loc; non-empty ranks get
+            # [0, cumsum_1, ..., cumsum_K, 1, 1, ...].
+            if num_reqs_in_rank > 0:
+                cs = 0
+                for q_idx, query in enumerate(queries):
+                    cs += len(query)
+                    query_start_loc[qsl_offset + q_idx + 1] = cs
+                query_start_loc[qsl_offset + num_reqs_in_rank +
+                                1:qsl_offset + padded_reqs_per_rank + 1] = 1
+
+            num_decode = ri.get("num_decode", 0)
+            request_distribution[3 * rank] = num_decode
+            request_distribution[3 * rank + 1] = num_decode
+            request_distribution[3 * rank + 2] = num_reqs_in_rank
+
+        return {
+            "input_ids": input_ids,
+            "positions": positions,
+            "query_start_loc": query_start_loc,
+            "seq_lens": seq_lens,
+            "block_tables": block_tables,
+            "request_distribution": request_distribution,
+            "padded_tokens_per_rank": padded_tokens_per_rank,
+            "padded_reqs_per_rank": padded_reqs_per_rank,
+            "max_blocks_per_req": max_blocks_per_req,
+        }
+
     def _prefill_scoring_prefix(
         self, prompt_token_ids: list[int]
     ) -> PrefixScoringState:
@@ -738,23 +948,28 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             raise ValueError("Prompt token ids must be non-empty")
         context_token_ids = prompt_token_ids[:-1]
         context_len = len(context_token_ids)
-        num_blocks = cdiv(context_len, self.block_size)
-        context_kv_caches = self._create_scoring_kv_caches(num_blocks)
+        local_num_blocks = cdiv(context_len, self.block_size)
+        context_kv_caches = self._create_scoring_kv_caches(local_num_blocks)
         if context_token_ids:
-            input_ids = np.asarray(context_token_ids, dtype=np.int32)
-            positions = np.arange(context_len, dtype=np.int32)
-            query_start_loc = np.asarray([0, context_len], dtype=np.int32)
-            seq_lens = np.asarray([context_len], dtype=np.int32)
-            block_tables = np.asarray([list(range(num_blocks))], dtype=np.int32)
-            request_distribution = np.asarray([0, 0, 1], dtype=np.int32)
+            block_table_row = list(range(local_num_blocks))
+            # Same prompt row replicated into every rank's local segment so each
+            # shard ends up with its own copy of the prefix in local blocks
+            # [0, local_num_blocks).
+            rank_inputs = [{
+                "queries": [list(context_token_ids)],
+                "query_start_positions": [0],
+                "block_table_rows": [block_table_row],
+                "num_decode": 0,
+            } for _ in range(self.dp_size)]
+            packed = self._pack_scorer_dp_inputs(rank_inputs)
             (input_ids_dev, positions_dev,
-             attention_metadata) = self._device_attention_metadata(
-                 input_ids,
-                 positions,
-                 query_start_loc,
-                 seq_lens,
-                 block_tables,
-                 request_distribution,
+             attention_metadata) = self._scorer_dp_device_attention_metadata(
+                 packed["input_ids"],
+                 packed["positions"],
+                 packed["query_start_loc"],
+                 packed["seq_lens"],
+                 packed["block_tables"],
+                 packed["request_distribution"],
              )
             input_ids_dev, inputs_embeds = self._get_input_ids_embeds(
                 input_ids_dev, [])
@@ -776,7 +991,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         return PrefixScoringState(
             prompt_token_ids=list(prompt_token_ids),
             context_kv_caches=context_kv_caches,
-            allocated_num_blocks=num_blocks,
+            allocated_num_blocks=local_num_blocks,
         )
 
     def _copy_scoring_prefix_blocks(
@@ -789,16 +1004,28 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     ) -> list[jax.Array]:
         if num_blocks == 0:
             return target_kv_caches
-        kv_cache_slices = KVCacheManager._jitted_gather_continuous_kv_cache(
+        if self.model_config.use_mla:
+            # MLA caches use PartitionSpec(MLP_TENSOR); the shard-local
+            # helper's spec doesn't match. MLA + DP is rejected upstream,
+            # so the global-view path is correct here.
+            kv_cache_slices = KVCacheManager._jitted_gather_continuous_kv_cache(
+                source_kv_caches,
+                source_block,
+                num_blocks,
+            )
+            return KVCacheManager._jitted_insert_continuous_kv_cache(
+                self.block_size,
+                target_kv_caches,
+                kv_cache_slices,
+                target_block,
+            )
+        return _scorer_shard_local_copy_kv_blocks(
+            self.mesh,
+            target_kv_caches,
             source_kv_caches,
             source_block,
-            num_blocks,
-        )
-        return KVCacheManager._jitted_insert_continuous_kv_cache(
-            self.block_size,
-            target_kv_caches,
-            kv_cache_slices,
             target_block,
+            num_blocks,
         )
 
     def _score_suffixes_from_state(
@@ -809,20 +1036,45 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         prompt_token_ids = scoring_state.prompt_token_ids
         prefix_len = len(prompt_token_ids)
         base_len = prefix_len - 1
-        shared_full_blocks = base_len // self.block_size
-        has_private_prefix_tail = (base_len % self.block_size) != 0
-        private_prefix_source_block = shared_full_blocks
+        block_size = self.block_size
+        dp_size = self.dp_size
+        shared_full_blocks = base_len // block_size
+        has_private_prefix_tail = (base_len % block_size) != 0
         last_prefix_token = prompt_token_ids[-1]
+
         query_lengths = [1 + len(tokens) for tokens in suffix_token_ids]
         req_block_counts = [
-            cdiv(base_len + query_len, self.block_size) for query_len in query_lengths
+            cdiv(base_len + ql, block_size) for ql in query_lengths
         ]
         private_blocks_per_req = [
-            req_block_count - shared_full_blocks for req_block_count in req_block_counts
+            rbc - shared_full_blocks for rbc in req_block_counts
         ]
-        total_blocks = shared_full_blocks + sum(private_blocks_per_req)
-        self._ensure_scoring_scratch_capacity(total_blocks)
+
+        # Round-robin assign suffixes to DP ranks.
+        rank_to_suffix_idxs: list[list[int]] = [[] for _ in range(dp_size)]
+        for i in range(len(suffix_token_ids)):
+            rank_to_suffix_idxs[i % dp_size].append(i)
+        max_assigned_per_rank = max(
+            (len(s) for s in rank_to_suffix_idxs), default=0)
+
+        # Make per-rank private layout uniform: at "rank position" k, reserve
+        # max_private_at_position[k] blocks across ranks. Each rank's k-th
+        # assigned suffix occupies the first private_blocks_per_req blocks of
+        # its position-k slot; remaining slots in that position go unused.
+        max_private_at_position = [0] * max_assigned_per_rank
+        for r in range(dp_size):
+            for k, suffix_idx in enumerate(rank_to_suffix_idxs[r]):
+                if private_blocks_per_req[suffix_idx] > max_private_at_position[k]:
+                    max_private_at_position[k] = private_blocks_per_req[
+                        suffix_idx]
+        private_offsets = [shared_full_blocks]
+        for m in max_private_at_position:
+            private_offsets.append(private_offsets[-1] + m)
+        local_total_blocks = private_offsets[-1]
+
+        self._ensure_scoring_scratch_capacity(local_total_blocks)
         kv_caches = self.scoring_scratch_kv_caches
+        # Replicate the shared prefix blocks into every shard's scratch slice.
         kv_caches = self._copy_scoring_prefix_blocks(
             kv_caches,
             scoring_state.context_kv_caches,
@@ -832,58 +1084,97 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         )
         self.scoring_scratch_kv_caches = kv_caches
 
-        max_req_blocks = max(req_block_counts)
-        block_tables = np.zeros((len(suffix_token_ids), max_req_blocks), dtype=np.int32)
-        private_block_start = shared_full_blocks
-        for req_idx, private_block_count in enumerate(private_blocks_per_req):
-            req_block_ids = list(range(shared_full_blocks))
-            req_private_block_start = private_block_start
-            req_block_ids.extend(
-                range(req_private_block_start, req_private_block_start + private_block_count)
-            )
-            block_tables[req_idx, :len(req_block_ids)] = req_block_ids
-            if has_private_prefix_tail:
+        # If the prefix has a partial tail block, replicate it into the first
+        # private slot of every assigned position k. One helper call per k
+        # copies the tail across all shards simultaneously.
+        if has_private_prefix_tail:
+            for k in range(max_assigned_per_rank):
                 kv_caches = self._copy_scoring_prefix_blocks(
                     kv_caches,
                     scoring_state.context_kv_caches,
-                    private_prefix_source_block,
-                    req_private_block_start,
+                    shared_full_blocks,
+                    private_offsets[k],
                     1,
                 )
                 self.scoring_scratch_kv_caches = kv_caches
-            private_block_start += private_block_count
 
-        flattened_input_ids: list[int] = []
-        flattened_positions: list[int] = []
-        query_start_loc = [0]
-        seq_lens = []
-        score_indices: list[int] = []
-        target_token_ids: list[int] = []
-        token_offset = 0
-        for tokens in suffix_token_ids:
-            query_tokens = [last_prefix_token] + tokens
-            flattened_input_ids.extend(query_tokens)
-            flattened_positions.extend(range(base_len, base_len + len(query_tokens)))
-            query_start_loc.append(query_start_loc[-1] + len(query_tokens))
-            seq_lens.append(base_len + len(query_tokens))
-            score_indices.extend(range(token_offset, token_offset + len(tokens)))
-            target_token_ids.extend(tokens)
-            token_offset += len(query_tokens)
+        # Build per-rank inputs and a map from original suffix index back to
+        # its (rank, intra-rank score offset, num_tokens) span.
+        rank_inputs: list[dict] = []
+        suffix_to_score_span: list[tuple[int, int, int]] = [(0, 0, 0)] * len(
+            suffix_token_ids)
 
-        input_ids = np.asarray(flattened_input_ids, dtype=np.int32)
-        positions = np.asarray(flattened_positions, dtype=np.int32)
-        query_start_loc_np = np.asarray(query_start_loc, dtype=np.int32)
-        seq_lens_np = np.asarray(seq_lens, dtype=np.int32)
-        request_distribution = np.asarray([0, 0, len(suffix_token_ids)], dtype=np.int32)
-        input_ids_dev, positions_dev, attention_metadata = self._device_attention_metadata(
-            input_ids,
-            positions,
-            query_start_loc_np,
-            seq_lens_np,
-            block_tables,
-            request_distribution,
-        )
-        input_ids_dev, inputs_embeds = self._get_input_ids_embeds(input_ids_dev, [])
+        for r in range(dp_size):
+            queries = []
+            query_start_positions = []
+            block_table_rows = []
+            rank_score_offset = 0
+
+            for k, suffix_idx in enumerate(rank_to_suffix_idxs[r]):
+                tokens = suffix_token_ids[suffix_idx]
+                queries.append([last_prefix_token, *tokens])
+                query_start_positions.append(base_len)
+                row = list(range(shared_full_blocks))
+                row.extend(
+                    range(
+                        private_offsets[k],
+                        private_offsets[k] +
+                        private_blocks_per_req[suffix_idx]))
+                block_table_rows.append(row)
+                suffix_to_score_span[suffix_idx] = (r, rank_score_offset,
+                                                    len(tokens))
+                rank_score_offset += len(tokens)
+
+            rank_inputs.append({
+                "queries": queries,
+                "query_start_positions": query_start_positions,
+                "block_table_rows": block_table_rows,
+                "num_decode": 0,
+            })
+
+        packed = self._pack_scorer_dp_inputs(rank_inputs)
+
+        # Build score_indices and target_token_ids per-rank-local, then pack
+        # into rank segments with their own padding bucket.
+        score_indices_per_rank: list[list[int]] = [[] for _ in range(dp_size)]
+        target_token_ids_per_rank: list[list[int]] = [[] for _ in range(dp_size)]
+        for r in range(dp_size):
+            flat = 0
+            for suffix_idx in rank_to_suffix_idxs[r]:
+                tokens = suffix_token_ids[suffix_idx]
+                score_indices_per_rank[r].extend(
+                    range(flat, flat + len(tokens)))
+                target_token_ids_per_rank[r].extend(tokens)
+                flat += 1 + len(tokens)
+
+        max_score_per_rank = max(
+            (len(s) for s in score_indices_per_rank), default=0)
+        padded_score_per_rank = runner_utils.get_padded_token_len(
+            self.num_tokens_paddings_per_dp, max(1, max_score_per_rank))
+
+        score_indices_packed = np.zeros(padded_score_per_rank * dp_size,
+                                        dtype=np.int32)
+        target_token_ids_packed = np.zeros(padded_score_per_rank * dp_size,
+                                           dtype=np.int32)
+        for r in range(dp_size):
+            offset = r * padded_score_per_rank
+            si = score_indices_per_rank[r]
+            ti = target_token_ids_per_rank[r]
+            if si:
+                score_indices_packed[offset:offset + len(si)] = si
+                target_token_ids_packed[offset:offset + len(ti)] = ti
+
+        (input_ids_dev, positions_dev,
+         attention_metadata) = self._scorer_dp_device_attention_metadata(
+             packed["input_ids"],
+             packed["positions"],
+             packed["query_start_loc"],
+             packed["seq_lens"],
+             packed["block_tables"],
+             packed["request_distribution"],
+         )
+        input_ids_dev, inputs_embeds = self._get_input_ids_embeds(
+            input_ids_dev, [])
         lora_metadata = self.lora_utils.extract_lora_metadata()
         with set_forward_context(None, self.vllm_config):
             kv_caches, hidden_states, _ = self.model_fn(
@@ -900,15 +1191,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 self.is_last_rank,
             )
         self.scoring_scratch_kv_caches = kv_caches
-        score_indices_dev = device_array(
-            self.mesh, np.asarray(score_indices, dtype=np.int32)
-        )
-        target_token_ids_dev = device_array(
-            self.mesh, np.asarray(target_token_ids, dtype=np.int32)
+
+        attn_data_sharding = NamedSharding(
+            self.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+        score_indices_dev, target_token_ids_dev = device_array(
+            self.mesh,
+            (score_indices_packed, target_token_ids_packed),
+            sharding=attn_data_sharding,
         )
         suffix_hidden_states = self._select_from_array_fn(
-            hidden_states, score_indices_dev
-        )
+            hidden_states, score_indices_dev)
         suffix_logits = self.compute_logits_fn(
             self.state,
             suffix_hidden_states,
@@ -919,12 +1211,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             target_token_ids_dev,
         )
         token_scores = np.asarray(jax.device_get(suffix_logprobs))
-        scores = []
-        offset = 0
-        for tokens in suffix_token_ids:
-            next_offset = offset + len(tokens)
-            scores.append(float(token_scores[offset:next_offset].sum()))
-            offset = next_offset
+
+        scores: list[float] = []
+        for original_idx in range(len(suffix_token_ids)):
+            rank, start_in_rank, num_tokens = suffix_to_score_span[
+                original_idx]
+            flat_offset = rank * padded_score_per_rank + start_in_rank
+            scores.append(
+                float(token_scores[flat_offset:flat_offset +
+                                   num_tokens].sum()))
         return scores
 
     def get_kv_cache_spec(self):
