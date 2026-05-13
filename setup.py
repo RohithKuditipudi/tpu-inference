@@ -69,8 +69,8 @@ def get_requirements() -> List[str]:
 
 
 def get_version():
-    version = os.getenv("VLLM_VERSION_OVERRIDE", "0.0.0").strip()
-    if os.getenv("IS_FOR_V7X", "true").lower() == "false":
+    version = os.getenv("VLLM_VERSION_OVERRIDE", "0.13.2.post6").strip()
+    if os.getenv("IS_FOR_V7X", "true").lower() == "false" and not version.endswith(".post6"):
         version = f"{version}.post6"
 
     return version
