@@ -14,9 +14,11 @@
 
 import copy
 import functools
+import json
 import logging
 import os
 import random
+import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
@@ -87,6 +89,9 @@ from tpu_inference.utils import (device_array, make_optimized_mesh,
 logger = init_logger(__name__)
 
 FORCE_NEXT_TOKEN_ENV = "RERANK_FORCE_TOKEN_ID"
+TOKEN_DECISION_URL_ENV = "RERANK_TOKEN_DECISION_URL"
+TOKEN_DECISION_TIMEOUT_ENV = "RERANK_TOKEN_DECISION_TIMEOUT"
+TOKEN_DECISION_TOP_K_ENV = "RERANK_TOKEN_DECISION_TOP_K"
 
 logging.getLogger("torchax.tensor").setLevel(logging.ERROR)
 
@@ -352,6 +357,58 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             flush=True,
         )
         self.forced_next_token_ids.update(token_ids_by_request_id)
+
+    def _request_token_decision(
+        self,
+        req_ids: list[str],
+        logits: jax.Array,
+    ) -> dict[str, int]:
+        url = os.environ[TOKEN_DECISION_URL_ENV]
+        timeout = float(os.environ.get(TOKEN_DECISION_TIMEOUT_ENV, "30"))
+        top_k = int(os.environ.get(TOKEN_DECISION_TOP_K_ENV, "20"))
+        step_indices = {
+            req_id: len(self.requests[req_id].output_token_ids)
+            for req_id in req_ids
+        }
+        topk_by_request_id: dict[str, list[dict[str, float | int]]] = {}
+        if top_k > 0:
+            top_logits, top_token_ids = jax.lax.top_k(logits[:len(req_ids)],
+                                                      top_k)
+            top_logits_cpu = np.asarray(jax.device_get(top_logits))
+            top_token_ids_cpu = np.asarray(jax.device_get(top_token_ids))
+            topk_by_request_id = {
+                req_id: [
+                    {
+                        "token_id": int(token_id),
+                        "logit": float(logit),
+                    }
+                    for token_id, logit in zip(
+                        top_token_ids_cpu[index],
+                        top_logits_cpu[index],
+                    )
+                ]
+                for index, req_id in enumerate(req_ids)
+            }
+        payload = json.dumps({
+            "request_ids": req_ids,
+            "step_indices": step_indices,
+            "topk": topk_by_request_id,
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            decoded = json.loads(response.read().decode("utf-8"))
+
+        tokens = decoded.get("tokens")
+        if not isinstance(tokens, dict):
+            raise ValueError(
+                f"Token decision server response must contain a tokens dict: {decoded}"
+            )
+        return {str(req_id): int(token_id) for req_id, token_id in tokens.items()}
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -1538,8 +1595,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         else:
             step_rng = self.rng_params_for_sampling
 
+        num_reqs = self.input_batch.num_reqs
         force_next_token_id = os.environ.get(FORCE_NEXT_TOKEN_ENV)
-        debug_force_next_tokens = False
+        token_decision_url = os.environ.get(TOKEN_DECISION_URL_ENV)
         if force_next_token_id is not None:
             if spec_decode_metadata is not None:
                 raise NotImplementedError(
@@ -1551,33 +1609,30 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     f"{FORCE_NEXT_TOKEN_ENV}={token_id} is outside the "
                     f"vocabulary range [0, {logits.shape[-1]})")
             logits = jnp.full_like(logits, -jnp.inf).at[:, token_id].set(0.0)
-        elif self.forced_next_token_ids:
-            print(
-                "DEBUG force_next_tokens sampler "
-                f"runner_id={id(self)} req_ids={self.input_batch.req_ids[:self.input_batch.num_reqs]} "
-                f"tokens={self.forced_next_token_ids}",
-                flush=True,
-            )
+        elif token_decision_url is not None or self.forced_next_token_ids:
             if spec_decode_metadata is not None:
                 raise NotImplementedError(
                     "force_next_tokens() is not supported with speculative "
                     "decoding")
 
-            num_reqs = self.input_batch.num_reqs
+            req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+            if token_decision_url is not None:
+                forced_token_map = self._request_token_decision(
+                    req_ids, logits)
+            else:
+                forced_token_map = self.forced_next_token_ids
+
             forced_token_ids: list[int] = []
-            for req_id in self.input_batch.req_ids[:num_reqs]:
+            for req_id in req_ids:
                 assert req_id is not None
-                forced_token_ids.append(
-                    self.forced_next_token_ids.pop(req_id, INVALID_TOKEN_ID))
+                if token_decision_url is not None:
+                    forced_token_ids.append(
+                        forced_token_map.get(req_id, INVALID_TOKEN_ID))
+                else:
+                    forced_token_ids.append(
+                        forced_token_map.pop(req_id, INVALID_TOKEN_ID))
             forced_token_ids.extend([INVALID_TOKEN_ID] *
                                     (logits.shape[0] - num_reqs))
-            debug_force_next_tokens = True
-            print(
-                "DEBUG force_next_tokens vector "
-                f"runner_id={id(self)} forced_token_ids={forced_token_ids} "
-                f"logits_shape={logits.shape} logits_indices_selector={logits_indices_selector}",
-                flush=True,
-            )
             active_forced_token_ids = [
                 token_id for token_id in forced_token_ids
                 if token_id != INVALID_TOKEN_ID
@@ -1604,12 +1659,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 logits,
                 tpu_sampling_metadata,
             )
-            if debug_force_next_tokens:
-                print(
-                    "DEBUG force_next_tokens raw_next_tokens "
-                    f"runner_id={id(self)} next_tokens={np.asarray(jax.device_get(next_tokens)).tolist()}",
-                    flush=True,
-                )
         else:
             if tpu_sampling_metadata.do_sampling:
                 bonus_rng, rejection_rng = jax.random.split(step_rng)
