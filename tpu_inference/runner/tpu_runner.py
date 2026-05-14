@@ -346,6 +346,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     def force_next_tokens(self,
                           token_ids_by_request_id: dict[str, int]) -> None:
         """Force specific requests to emit a token at their next sample step."""
+        print(
+            "DEBUG force_next_tokens runner "
+            f"runner_id={id(self)} tokens={token_ids_by_request_id}",
+            flush=True,
+        )
         self.forced_next_token_ids.update(token_ids_by_request_id)
 
     def _init_random(self):
@@ -1546,6 +1551,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     f"vocabulary range [0, {logits.shape[-1]})")
             logits = jnp.full_like(logits, -jnp.inf).at[:, token_id].set(0.0)
         elif self.forced_next_token_ids:
+            print(
+                "DEBUG force_next_tokens sampler "
+                f"runner_id={id(self)} req_ids={self.input_batch.req_ids[:self.input_batch.num_reqs]} "
+                f"tokens={self.forced_next_token_ids}",
+                flush=True,
+            )
             if spec_decode_metadata is not None:
                 raise NotImplementedError(
                     "force_next_tokens() is not supported with speculative "

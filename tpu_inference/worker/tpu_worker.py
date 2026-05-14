@@ -345,6 +345,12 @@ class TPUWorker:
         return self.model_runner.take_draft_token_ids()
 
     def force_next_tokens(self, token_ids_by_request_id: dict[str, int]) -> None:
+        print(
+            "DEBUG force_next_tokens worker "
+            f"worker_id={id(self)} runner_id={id(self.model_runner)} "
+            f"tokens={token_ids_by_request_id}",
+            flush=True,
+        )
         self.model_runner.force_next_tokens(token_ids_by_request_id)
 
     def add_lora(
