@@ -1776,30 +1776,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         if spec_decode_metadata is None:
             next_tokens = np.asarray(jax.device_get(next_tokens))
-            if debug_force_next_tokens:
-                print(
-                    "DEBUG force_next_tokens device_get "
-                    f"runner_id={id(self)} next_tokens={next_tokens.tolist()} "
-                    f"logits_indices_selector={logits_indices_selector}",
-                    flush=True,
-                )
             # Map tokens back to the pre-dp shuffling order
             if logits_indices_selector is not None:
                 next_tokens = next_tokens[logits_indices_selector]
-                if debug_force_next_tokens:
-                    print(
-                        "DEBUG force_next_tokens selected "
-                        f"runner_id={id(self)} next_tokens={next_tokens.tolist()}",
-                        flush=True,
-                    )
             selected_token_ids = np.expand_dims(next_tokens[:num_reqs], 1)
             valid_sampled_token_ids = selected_token_ids.tolist()
-            if debug_force_next_tokens:
-                print(
-                    "DEBUG force_next_tokens valid_sampled "
-                    f"runner_id={id(self)} valid_sampled_token_ids={valid_sampled_token_ids}",
-                    flush=True,
-                )
         else:
             valid_sampled_token_ids = self.rejection_sampler.parse_output(
                 next_tokens, self.input_batch.vocab_size,
