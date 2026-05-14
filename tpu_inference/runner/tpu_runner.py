@@ -15,6 +15,7 @@
 import copy
 import functools
 import logging
+import os
 import random
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -84,6 +85,8 @@ from tpu_inference.utils import (device_array, make_optimized_mesh,
                                  time_function, to_jax_dtype, to_torch_dtype)
 
 logger = init_logger(__name__)
+
+FORCE_NEXT_TOKEN_ENV = "RERANK_FORCE_TOKEN_ID"
 
 logging.getLogger("torchax.tensor").setLevel(logging.ERROR)
 
@@ -1523,6 +1526,19 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 self.rng_params_for_sampling)
         else:
             step_rng = self.rng_params_for_sampling
+
+        force_next_token_id = os.environ.get(FORCE_NEXT_TOKEN_ENV)
+        if force_next_token_id is not None:
+            if spec_decode_metadata is not None:
+                raise NotImplementedError(
+                    f"{FORCE_NEXT_TOKEN_ENV} is not supported with "
+                    "speculative decoding")
+            token_id = int(force_next_token_id)
+            if token_id < 0 or token_id >= logits.shape[-1]:
+                raise ValueError(
+                    f"{FORCE_NEXT_TOKEN_ENV}={token_id} is outside the "
+                    f"vocabulary range [0, {logits.shape[-1]})")
+            logits = jnp.full_like(logits, -jnp.inf).at[:, token_id].set(0.0)
 
         if spec_decode_metadata is None:
             next_tokens = sample(
