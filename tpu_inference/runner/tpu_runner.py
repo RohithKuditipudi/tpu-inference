@@ -1539,6 +1539,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             step_rng = self.rng_params_for_sampling
 
         force_next_token_id = os.environ.get(FORCE_NEXT_TOKEN_ENV)
+        debug_force_next_tokens = False
         if force_next_token_id is not None:
             if spec_decode_metadata is not None:
                 raise NotImplementedError(
@@ -1570,6 +1571,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     self.forced_next_token_ids.pop(req_id, INVALID_TOKEN_ID))
             forced_token_ids.extend([INVALID_TOKEN_ID] *
                                     (logits.shape[0] - num_reqs))
+            debug_force_next_tokens = True
+            print(
+                "DEBUG force_next_tokens vector "
+                f"runner_id={id(self)} forced_token_ids={forced_token_ids} "
+                f"logits_shape={logits.shape} logits_indices_selector={logits_indices_selector}",
+                flush=True,
+            )
             active_forced_token_ids = [
                 token_id for token_id in forced_token_ids
                 if token_id != INVALID_TOKEN_ID
@@ -1596,6 +1604,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 logits,
                 tpu_sampling_metadata,
             )
+            if debug_force_next_tokens:
+                print(
+                    "DEBUG force_next_tokens raw_next_tokens "
+                    f"runner_id={id(self)} next_tokens={np.asarray(jax.device_get(next_tokens)).tolist()}",
+                    flush=True,
+                )
         else:
             if tpu_sampling_metadata.do_sampling:
                 bonus_rng, rejection_rng = jax.random.split(step_rng)
@@ -1713,11 +1727,30 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         if spec_decode_metadata is None:
             next_tokens = np.asarray(jax.device_get(next_tokens))
+            if debug_force_next_tokens:
+                print(
+                    "DEBUG force_next_tokens device_get "
+                    f"runner_id={id(self)} next_tokens={next_tokens.tolist()} "
+                    f"logits_indices_selector={logits_indices_selector}",
+                    flush=True,
+                )
             # Map tokens back to the pre-dp shuffling order
             if logits_indices_selector is not None:
                 next_tokens = next_tokens[logits_indices_selector]
+                if debug_force_next_tokens:
+                    print(
+                        "DEBUG force_next_tokens selected "
+                        f"runner_id={id(self)} next_tokens={next_tokens.tolist()}",
+                        flush=True,
+                    )
             selected_token_ids = np.expand_dims(next_tokens[:num_reqs], 1)
             valid_sampled_token_ids = selected_token_ids.tolist()
+            if debug_force_next_tokens:
+                print(
+                    "DEBUG force_next_tokens valid_sampled "
+                    f"runner_id={id(self)} valid_sampled_token_ids={valid_sampled_token_ids}",
+                    flush=True,
+                )
         else:
             valid_sampled_token_ids = self.rejection_sampler.parse_output(
                 next_tokens, self.input_batch.vocab_size,
