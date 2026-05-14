@@ -344,6 +344,9 @@ class TPUWorker:
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         return self.model_runner.take_draft_token_ids()
 
+    def force_next_tokens(self, token_ids_by_request_id: dict[str, int]) -> None:
+        self.model_runner.force_next_tokens(token_ids_by_request_id)
+
     def add_lora(
         self,
         lora_request: LoRARequest,
