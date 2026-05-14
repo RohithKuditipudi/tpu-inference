@@ -341,6 +341,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.scoring_state: PrefixScoringState | None = None
         self.scoring_scratch_kv_caches: list[jax.Array] = []
         self.scoring_scratch_num_blocks = 0
+        self.forced_next_token_ids: dict[str, int] = {}
+
+    def force_next_tokens(self,
+                          token_ids_by_request_id: dict[str, int]) -> None:
+        """Force specific requests to emit a token at their next sample step."""
+        self.forced_next_token_ids.update(token_ids_by_request_id)
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -1539,6 +1545,38 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     f"{FORCE_NEXT_TOKEN_ENV}={token_id} is outside the "
                     f"vocabulary range [0, {logits.shape[-1]})")
             logits = jnp.full_like(logits, -jnp.inf).at[:, token_id].set(0.0)
+        elif self.forced_next_token_ids:
+            if spec_decode_metadata is not None:
+                raise NotImplementedError(
+                    "force_next_tokens() is not supported with speculative "
+                    "decoding")
+
+            num_reqs = self.input_batch.num_reqs
+            forced_token_ids: list[int] = []
+            for req_id in self.input_batch.req_ids[:num_reqs]:
+                assert req_id is not None
+                forced_token_ids.append(
+                    self.forced_next_token_ids.pop(req_id, INVALID_TOKEN_ID))
+            forced_token_ids.extend([INVALID_TOKEN_ID] *
+                                    (logits.shape[0] - num_reqs))
+            active_forced_token_ids = [
+                token_id for token_id in forced_token_ids
+                if token_id != INVALID_TOKEN_ID
+            ]
+            if any(token_id < 0 or token_id >= logits.shape[-1]
+                   for token_id in active_forced_token_ids):
+                raise ValueError(
+                    "force_next_tokens() received a token id outside the "
+                    f"vocabulary range [0, {logits.shape[-1]})")
+
+            forced = jnp.asarray(forced_token_ids)
+            has_forced = forced != INVALID_TOKEN_ID
+
+            rows = jnp.arange(logits.shape[0])
+            safe_forced = jnp.where(has_forced, forced, 0)
+            forced_logits = jnp.full_like(logits, -jnp.inf)
+            forced_logits = forced_logits.at[rows, safe_forced].set(0.0)
+            logits = jnp.where(has_forced[:, None], forced_logits, logits)
 
         if spec_decode_metadata is None:
             next_tokens = sample(
