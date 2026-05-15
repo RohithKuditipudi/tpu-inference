@@ -1631,17 +1631,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             else:
                 forced_token_map = self.forced_next_token_ids
 
-            forced_token_ids: list[int] = []
-            for req_id in req_ids:
+            # Place each req's forced token in its TPU-layout slot, not its
+            # input_batch position. In DP mode logits rows are in TPU/padded
+            # layout (see _prepare_dp_input_metadata); next_tokens are reordered
+            # to input_batch order downstream via next_tokens[selector], but the
+            # forcing has to write to the row that sample() will draw from.
+            forced_token_ids: list[int] = [INVALID_TOKEN_ID] * logits.shape[0]
+            for i, req_id in enumerate(req_ids):
                 assert req_id is not None
                 if token_decision_url is not None:
-                    forced_token_ids.append(
-                        forced_token_map.get(req_id, INVALID_TOKEN_ID))
+                    token_id = forced_token_map.get(req_id, INVALID_TOKEN_ID)
                 else:
-                    forced_token_ids.append(
-                        forced_token_map.pop(req_id, INVALID_TOKEN_ID))
-            forced_token_ids.extend([INVALID_TOKEN_ID] *
-                                    (logits.shape[0] - num_reqs))
+                    token_id = forced_token_map.pop(req_id, INVALID_TOKEN_ID)
+                slot = (int(logits_indices_selector[i])
+                        if logits_indices_selector is not None else i)
+                forced_token_ids[slot] = token_id
             active_forced_token_ids = [
                 token_id for token_id in forced_token_ids
                 if token_id != INVALID_TOKEN_ID
