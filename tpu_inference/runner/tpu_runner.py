@@ -373,18 +373,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         }
         topk_by_request_id: dict[str, list[dict[str, float | int]]] = {}
         if top_k > 0:
+            # Run top_k on the bucketed (padded_num_reqs, vocab) tensor so the
+            # JAX op only sees the small set of padded shapes and never
+            # recompiles per num_reqs. Then do the row reorder CPU-side.
             # In DP mode, raw logit rows are in TPU/padded layout, not
-            # input_batch order. Reorder via logits_indices_selector so row i
+            # input_batch order; reorder via logits_indices_selector so row i
             # corresponds to req_ids[i]. See _jax_logprobs_to_lists and the
             # next_tokens[logits_indices_selector] remap in _sample_from_logits.
             top_logits, top_token_ids = jax.lax.top_k(logits, top_k)
-            if logits_indices_selector is not None:
-                top_logits = top_logits[logits_indices_selector]
-                top_token_ids = top_token_ids[logits_indices_selector]
-            top_logits = top_logits[:len(req_ids)]
-            top_token_ids = top_token_ids[:len(req_ids)]
             top_logits_cpu = np.asarray(jax.device_get(top_logits))
             top_token_ids_cpu = np.asarray(jax.device_get(top_token_ids))
+            if logits_indices_selector is not None:
+                top_logits_cpu = top_logits_cpu[logits_indices_selector]
+                top_token_ids_cpu = top_token_ids_cpu[logits_indices_selector]
+            top_logits_cpu = top_logits_cpu[:len(req_ids)]
+            top_token_ids_cpu = top_token_ids_cpu[:len(req_ids)]
             topk_by_request_id = {
                 req_id: [
                     {
