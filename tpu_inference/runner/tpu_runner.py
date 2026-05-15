@@ -362,6 +362,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self,
         req_ids: list[str],
         logits: jax.Array,
+        logits_indices_selector: Optional[List[int]] = None,
     ) -> dict[str, int]:
         url = os.environ[TOKEN_DECISION_URL_ENV]
         timeout = float(os.environ.get(TOKEN_DECISION_TIMEOUT_ENV, "30"))
@@ -372,8 +373,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         }
         topk_by_request_id: dict[str, list[dict[str, float | int]]] = {}
         if top_k > 0:
-            top_logits, top_token_ids = jax.lax.top_k(logits[:len(req_ids)],
-                                                      top_k)
+            # In DP mode, raw logit rows are in TPU/padded layout, not
+            # input_batch order. Reorder via logits_indices_selector so row i
+            # corresponds to req_ids[i]. See _jax_logprobs_to_lists and the
+            # next_tokens[logits_indices_selector] remap in _sample_from_logits.
+            top_logits, top_token_ids = jax.lax.top_k(logits, top_k)
+            if logits_indices_selector is not None:
+                top_logits = top_logits[logits_indices_selector]
+                top_token_ids = top_token_ids[logits_indices_selector]
+            top_logits = top_logits[:len(req_ids)]
+            top_token_ids = top_token_ids[:len(req_ids)]
             top_logits_cpu = np.asarray(jax.device_get(top_logits))
             top_token_ids_cpu = np.asarray(jax.device_get(top_token_ids))
             topk_by_request_id = {
@@ -1618,7 +1627,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
             if token_decision_url is not None:
                 forced_token_map = self._request_token_decision(
-                    req_ids, logits)
+                    req_ids, logits, logits_indices_selector)
             else:
                 forced_token_map = self.forced_next_token_ids
 
