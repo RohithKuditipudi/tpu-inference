@@ -13,8 +13,11 @@
 # limitations under the License.
 
 import functools
+import json
 import logging
+import os
 import random
+import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
@@ -83,6 +86,10 @@ from tpu_inference.utils import (device_array, make_optimized_mesh,
                                  time_function, to_jax_dtype, to_torch_dtype)
 
 logger = init_logger(__name__)
+
+TOKEN_DECISION_URL_ENV = "RERANK_TOKEN_DECISION_URL"
+TOKEN_DECISION_TIMEOUT_ENV = "RERANK_TOKEN_DECISION_TIMEOUT"
+TOKEN_DECISION_TOP_K_ENV = "RERANK_TOKEN_DECISION_TOP_K"
 
 logging.getLogger("torchax.tensor").setLevel(logging.ERROR)
 
@@ -302,6 +309,64 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self.is_pooling_model: bool = self.model_config.runner_type == "pooling"
         """Generative model or pooling model select different computations."""
+
+    def _request_token_decision(
+        self,
+        req_ids: list[str],
+        logits: jax.Array,
+        logits_indices_selector: Optional[List[int]] = None,
+    ) -> dict[str, int]:
+        url = os.environ[TOKEN_DECISION_URL_ENV]
+        timeout = float(os.environ.get(TOKEN_DECISION_TIMEOUT_ENV, "30"))
+        top_k = int(os.environ.get(TOKEN_DECISION_TOP_K_ENV, "20"))
+        step_indices = {
+            req_id: len(self.requests[req_id].output_token_ids)
+            for req_id in req_ids
+        }
+        topk_by_request_id: dict[str, list[dict[str, float | int]]] = {}
+        if top_k > 0:
+            # Run top_k on the bucketed logits shape, then reorder rows on CPU.
+            top_logits, top_token_ids = jax.lax.top_k(logits, top_k)
+            top_logits_cpu = np.asarray(jax.device_get(top_logits))
+            top_token_ids_cpu = np.asarray(jax.device_get(top_token_ids))
+            if logits_indices_selector is not None:
+                top_logits_cpu = top_logits_cpu[logits_indices_selector]
+                top_token_ids_cpu = top_token_ids_cpu[logits_indices_selector]
+            top_logits_cpu = top_logits_cpu[:len(req_ids)]
+            top_token_ids_cpu = top_token_ids_cpu[:len(req_ids)]
+            topk_by_request_id = {
+                req_id: [
+                    {
+                        "token_id": int(token_id),
+                        "logit": float(logit),
+                    }
+                    for token_id, logit in zip(
+                        top_token_ids_cpu[index],
+                        top_logits_cpu[index],
+                    )
+                ]
+                for index, req_id in enumerate(req_ids)
+            }
+        payload = json.dumps({
+            "request_ids": req_ids,
+            "step_indices": step_indices,
+            "topk": topk_by_request_id,
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            decoded = json.loads(response.read().decode("utf-8"))
+
+        tokens = decoded.get("tokens")
+        if not isinstance(tokens, dict):
+            raise ValueError(
+                f"Token decision server response must contain a tokens dict: {decoded}"
+            )
+        return {str(req_id): int(token_id) for req_id, token_id in tokens.items()}
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -939,8 +1004,48 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         else:
             step_rng = self.rng_params_for_sampling
 
+        token_decision_url = os.environ.get(TOKEN_DECISION_URL_ENV)
+        if token_decision_url is not None and spec_decode_metadata is not None:
+            raise NotImplementedError(
+                "Token decision callback is not supported with speculative "
+                "decoding")
+
         if spec_decode_metadata is None:
             logits = logits.astype(jnp.float32)
+            if token_decision_url is not None:
+                num_reqs = self.input_batch.num_reqs
+                assert all(
+                    req_id is not None
+                    for req_id in self.input_batch.req_ids[:num_reqs]
+                ), "req_ids contains None"
+                req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+                forced_token_map = self._request_token_decision(
+                    req_ids, logits, logits_indices_selector)
+
+                forced_token_ids = [INVALID_TOKEN_ID] * logits.shape[0]
+                for index, req_id in enumerate(req_ids):
+                    token_id = forced_token_map.get(req_id, INVALID_TOKEN_ID)
+                    slot = (int(logits_indices_selector[index])
+                            if logits_indices_selector is not None else index)
+                    forced_token_ids[slot] = token_id
+
+                active_forced_token_ids = [
+                    token_id for token_id in forced_token_ids
+                    if token_id != INVALID_TOKEN_ID
+                ]
+                if any(token_id < 0 or token_id >= logits.shape[-1]
+                       for token_id in active_forced_token_ids):
+                    raise ValueError(
+                        "Token decision server returned a token id outside "
+                        f"the vocabulary range [0, {logits.shape[-1]})")
+
+                forced = jnp.asarray(forced_token_ids)
+                has_forced = forced != INVALID_TOKEN_ID
+                rows = jnp.arange(logits.shape[0])
+                safe_forced = jnp.where(has_forced, forced, 0)
+                forced_logits = jnp.full_like(logits, -jnp.inf)
+                forced_logits = forced_logits.at[rows, safe_forced].set(0.0)
+                logits = jnp.where(has_forced[:, None], forced_logits, logits)
             with self.maybe_forbid_compile:
                 next_tokens, processed_logits = sample(
                     step_rng,
